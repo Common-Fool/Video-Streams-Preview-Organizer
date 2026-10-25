@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-r"""VSPO — Video Streams Preview Organizer (pairview.py): browse preview sheets, delete videos, create previews, play in MPC.
+r"""VSPO — Video Streams Preview Organizer (pairview.py): browse preview sheets, delete videos, create previews, play in a video player.
 
   python pairview.py FOLDER                       videos and previews stored together (subfolders too)
   python pairview.py FOLDER --previews FOLDER2    previews in a separate folder (same subfolders)
@@ -16,6 +16,7 @@ The "Videos without previews" tab creates missing previews with ffmpeg (ffmpeg i
 Default preview: a 10×9 grid of frames, 2560 px wide, a timestamp on every frame (--cols --rows --width --header).
 "Recreate previews" on the "Previews" tab replaces old previews with new ones (the old ones go to _to_delete).
 "Remove previews without video" moves such previews to _to_delete, "Refresh" (F5) rereads the folder.
+Video player: chosen in the menu (☰ → Video player); MPC-HC is recommended on Windows. Windows, macOS and Linux.
 NVIDIA GPU: --gpu on decodes video on it; auto and off (default auto) use the CPU: for previews it is not slower.
 App window: needs pywebview (pip install pywebview); without it the gallery opens in the browser. --browser — always the browser.
 Shortcut without a console: pythonw.exe pairview.py "D:\Videos" (log and settings are in %APPDATA%\pairview).
@@ -57,7 +58,8 @@ TRASH_NAMES = (TRASH, '_на_удаление')  # второе — прежне
 APP = 'VSPO'  # название в окне, в заголовке страницы и у exe (Video Streams Preview Organizer)
 TOKEN = secrets.token_urlsafe(12)
 ROOT_NAME = ''
-PLAYER = {'path': ''}  # путь к MPC-HC/MPC-BE (--player или автопоиск)
+PLAYER = {'path': '', 'name': 'default app', 'kind': ''}  # видеоплеер: путь ('' — программа системы), имя, 'mpc' для MPC-HC/BE
+OS_NAME = 'win' if os.name == 'nt' else 'mac' if sys.platform == 'darwin' else 'linux'
 VROOT = ''   # корень с видео
 PROOT = ''   # корень с превью (тот же, если превью лежат вместе с видео)
 
@@ -648,7 +650,7 @@ def listing():
     return {'items': items, 'videos': videos, 'undo': undo, 'root': ROOT_NAME, 'rootPath': VROOT, 'recent': recent_roots(),
             'cut': cut_status(),
             'trash': trash_stats(), 'ff': ff_info(), 'job': job_status(),
-            'ign': {'exts': sorted(IGNORE), 'files': SCAN['ignored']}, 'mpc': player_info(),
+            'ign': {'exts': sorted(IGNORE), 'files': SCAN['ignored']}, 'player': player_info(),
             'opts': {'cols': OPTS['cols'], 'rows': OPTS['rows'], 'width': OPTS['width'], 'header': OPTS['header'],
                      'hw': gpu_info()}}
 
@@ -671,8 +673,44 @@ def base_dir():
     В собранном onefile-exe __file__ указывает во временную папку распаковки, поэтому берём путь к самому exe.
     """
     if getattr(sys, 'frozen', False):
+        app = mac_bundle()
+        if app:  # macOS: сам exe лежит внутри VSPO.app/Contents/MacOS, «рядом с программой» — это рядом с .app
+            return os.path.dirname(app)
+        if os.environ.get('APPIMAGE'):  # Linux AppImage: рядом с файлом .AppImage, а не во временной точке монтирования
+            return os.path.dirname(os.path.abspath(os.environ['APPIMAGE']))
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
+
+
+def mac_bundle():
+    """Путь к VSPO.app, если программа запущена из собранного приложения macOS; иначе ''."""
+    if sys.platform != 'darwin' or not getattr(sys, 'frozen', False):
+        return ''
+    p = os.path.abspath(sys.executable)
+    for _ in range(3):
+        p = os.path.dirname(p)
+    return p if p.lower().endswith('.app') else ''
+
+
+def fix_env():
+    """Окружение для запуска чужих программ (плеер, ffmpeg, браузер).
+
+    macOS: у приложения, запущенного из Finder, в PATH нет Homebrew — ffmpeg и mpv из brew иначе не находятся.
+    Linux, собранная версия: PyInstaller подменяет LD_LIBRARY_PATH на свои библиотеки, и системный ffmpeg или браузер
+    подхватывают их и падают. Нам самим это уже не нужно (библиотеки загружены при запуске), детям — вредно.
+    """
+    if sys.platform == 'darwin':
+        path = os.environ.get('PATH', '').split(os.pathsep)
+        for d in ('/opt/homebrew/bin', '/usr/local/bin'):
+            if d not in path and os.path.isdir(d):
+                path.append(d)
+        os.environ['PATH'] = os.pathsep.join(x for x in path if x)
+    elif os.name != 'nt' and getattr(sys, 'frozen', False):
+        orig = os.environ.pop('LD_LIBRARY_PATH_ORIG', None)
+        if orig:
+            os.environ['LD_LIBRARY_PATH'] = orig
+        else:
+            os.environ.pop('LD_LIBRARY_PATH', None)
 
 
 def app_dir():
@@ -793,21 +831,179 @@ def find_player(hint=None):
     """Найти MPC-HC или MPC-BE: сначала путь из параметра, потом K-Lite, потом стандартные папки и PATH."""
     cands = []
     if hint:
-        if os.path.isdir(hint):
+        if os.path.isdir(hint) and not hint.lower().rstrip('/').endswith('.app'):
             cands += [os.path.join(hint, n) for n in ('mpc-hc64.exe', 'mpc-hc.exe', 'mpc-be64.exe', 'mpc-be.exe')]
         cands.append(hint)
+        return next((c for c in cands if c and os.path.exists(c)), '')
+    if os.name != 'nt':
+        return ''
     cands.append(MPC_DEFAULT)
-    bases = [os.environ.get(k) for k in ('ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432')]
-    bases += [r'C:\Program Files', r'C:\Program Files (x86)']
-    for b in dict.fromkeys(x for x in bases if x):
+    for b in program_dirs():
         cands += [os.path.join(b, s) for s in MPC_SUBDIRS]
     cands += [shutil.which(n) for n in ('mpc-hc64', 'mpc-hc', 'mpc-be64', 'mpc-be')]
     return next((c for c in cands if c and os.path.isfile(c)), '')
 
 
+def program_dirs():
+    bases = [os.environ.get(k) for k in ('ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432')]
+    bases += [r'C:\Program Files', r'C:\Program Files (x86)']
+    return list(dict.fromkeys(x for x in bases if x))
+
+
+# имя плеера по имени файла: (часть имени, как показывать)
+PLAYER_NAMES = (('mpc-hc', 'MPC-HC'), ('mpc-be', 'MPC-BE'), ('mpc-qt', 'MPC-QT'), ('vlc', 'VLC'), ('mpv', 'mpv'),
+                ('potplayer', 'PotPlayer'), ('iina', 'IINA'), ('celluloid', 'Celluloid'), ('smplayer', 'SMPlayer'),
+                ('haruna', 'Haruna'))
+
+
+def player_name(path):
+    if not path:
+        return 'default app'
+    base = os.path.basename(path.rstrip('\\/'))
+    low = base.lower()
+    return next((n for k, n in PLAYER_NAMES if k in low), os.path.splitext(base)[0] or base)
+
+
+def player_kind(path):
+    """'mpc' — MPC-HC/MPC-BE (умеют /add, и только их окно выводится вперёд); '' — любой другой плеер."""
+    low = os.path.basename(path or '').lower()
+    return 'mpc' if os.name == 'nt' and ('mpc-hc' in low or 'mpc-be' in low) else ''
+
+
+def set_player(path):
+    PLAYER.update(path=path or '', name=player_name(path), kind=player_kind(path))
+
+
+def list_players():
+    """Установленные плееры, которые нашлись в стандартных местах: [(путь, имя)], без повторов по имени."""
+    cands = []
+    if os.name == 'nt':
+        cands.append(MPC_DEFAULT)
+        for b in program_dirs():
+            cands += [os.path.join(b, s) for s in MPC_SUBDIRS]
+            cands += [os.path.join(b, s) for s in (r'VideoLAN\VLC\vlc.exe', r'DAUM\PotPlayer\PotPlayerMini64.exe',
+                                                   r'DAUM\PotPlayer\PotPlayerMini.exe', r'mpv\mpv.exe')]
+        cands += [shutil.which(n) for n in ('mpc-hc64', 'mpc-be64', 'vlc', 'mpv')]
+    elif sys.platform == 'darwin':
+        for d in ('/Applications', os.path.expanduser('~/Applications')):
+            cands += [os.path.join(d, n) for n in ('IINA.app', 'VLC.app', 'mpv.app')]
+        cands.append(shutil.which('mpv'))
+    else:
+        cands += [shutil.which(n) for n in ('mpv', 'vlc', 'celluloid', 'smplayer', 'haruna', 'mpc-qt')]
+    out, seen = [], set()
+    for c in cands:
+        if c and os.path.exists(c):
+            name = player_name(c)
+            if name not in seen:
+                seen.add(name)
+                out.append((c, name))
+    return out
+
+
+def auto_player():
+    """Плеер по умолчанию: в Windows — MPC (рекомендуем), иначе первый найденный; ничего нет — программа системы."""
+    found = list_players()
+    mpc = [p for p, _n in found if player_kind(p) == 'mpc']
+    return (mpc or [p for p, _n in found] or [''])[0]
+
+
+def saved_player():
+    """Плеер, выбранный в меню: None — не выбирали; '' — программа системы."""
+    v = read_all_settings().get('player')
+    return v if isinstance(v, str) else None
+
+
+def save_player(path):
+    with SLOCK:
+        d = read_all_settings()
+        d['player'] = path
+        try:
+            write_all_settings(d)
+        except OSError as e:
+            print('Could not save settings:', e)
+    set_player(path)
+
+
 def player_info():
-    p = PLAYER['path']
-    return {'ok': bool(p), 'name': ('MPC-BE' if 'mpc-be' in os.path.basename(p).lower() else 'MPC-HC') if p else ''}
+    return {'ok': True, 'name': PLAYER['name'], 'path': PLAYER['path'], 'add': PLAYER['kind'] == 'mpc', 'os': OS_NAME}
+
+
+def players_menu():
+    """Для окна «Video player»: найденные плееры, текущий и рекомендованный."""
+    found = list_players()
+    cur = PLAYER['path']
+    if cur and all(os.path.normcase(p) != os.path.normcase(cur) for p, _n in found):
+        found.append((cur, player_name(cur)))
+    items = [{'id': p, 'name': n, 'path': p, 'rec': player_kind(p) == 'mpc'} for p, n in found]
+    items.append({'id': '', 'name': 'Default app of the system', 'path': 'whatever opens video files on double-click',
+                  'rec': False})
+    return {'current': cur, 'players': items, 'os': OS_NAME,
+            'mpc': any(i['rec'] for i in items)}
+
+
+def choose_player(pid):
+    """Выбрать плеер из найденных (по пути из списка) — путь с клиента берётся только отсюда."""
+    pid = str(pid or '')
+    ok = pid == '' or pid == PLAYER['path'] or any(p == pid for p, _n in list_players())
+    if not ok:
+        raise Fail('unknown player')
+    save_player(pid)
+    return player_info()
+
+
+def pick_player():
+    """Указать плеер вручную: диалог выбора файла на стороне сервера."""
+    if not PICKLOCK.acquire(blocking=False):
+        raise Fail('the dialog is already open', 409)
+    try:
+        path = ask_file()
+    finally:
+        PICKLOCK.release()
+    if not path:
+        return {'ok': False}
+    if not os.path.exists(path):
+        raise Fail('file not found: ' + path)
+    save_player(path)
+    return dict(player_info(), ok=True)
+
+
+def write_playlist(files):
+    """Список видео для плееров без /add: один файл .m3u8 вместо сотни путей в командной строке."""
+    path = os.path.join(app_dir(), 'playlist.m3u8')
+    os.makedirs(app_dir(), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('#EXTM3U\n' + ''.join(x + '\n' for x in files))
+    return path
+
+
+def launch(prog, args):
+    """Запустить программу отдельно от нас (macOS: приложение .app — через open -a)."""
+    if sys.platform == 'darwin' and prog.lower().rstrip('/').endswith('.app'):
+        cmd = ['open', '-a', prog] + args
+    else:
+        cmd = [prog] + args
+    kw = {'start_new_session': True} if os.name != 'nt' else {}
+    subprocess.Popen(cmd, close_fds=True, **kw)
+
+
+def play(files, add=False):
+    """Передать видео в выбранный плеер. add (дописать в плейлист, не запуская) умеет только MPC."""
+    files = [f for f in files if os.path.isfile(f)]
+    if not files:
+        raise Fail('there are no videos here')
+    if PLAYER['kind'] == 'mpc':
+        return send_to_mpc(files, add)
+    if add:
+        raise Fail('adding to a playlist works only with MPC-HC / MPC-BE')
+    target = files[0] if len(files) == 1 else write_playlist(files)
+    try:
+        if PLAYER['path']:
+            launch(PLAYER['path'], [target])
+        else:
+            open_file(target, front=len(files) == 1)
+    except OSError as e:
+        raise Fail('could not start %s: %s' % (PLAYER['name'], getattr(e, 'strerror', None) or e), 500)
+    return {'added': len(files), 'calls': 1}
 
 
 def tree_key(g):
@@ -843,11 +1039,6 @@ def send_to_mpc(files, add):
     совпадает с галереей. Командная строка Windows ограничена 32 767 знаками, поэтому длинный список идёт
     несколькими вызовами: первый (при воспроизведении) без /add, остальные с /add.
     """
-    if not PLAYER['path']:
-        raise Fail('MPC not found. Set its path with --player "C:\\...\\mpc-hc64.exe" or in pairview.json')
-    files = [f for f in files if os.path.isfile(f)]
-    if not files:
-        raise Fail('there are no videos here')
     chunks, cur, size = [], [], 0
     for f in files:
         n = len(f) + 3
@@ -899,7 +1090,9 @@ def show_in_explorer(rel=None, gid=None):
         else:
             os.startfile(target)
         threading.Thread(target=bring_to_front, args=(hint,), daemon=True).start()
-    else:
+    elif sys.platform == 'darwin' and select:
+        subprocess.Popen(['open', '-R', target])  # Finder с выделенным файлом
+    else:  # Linux: выделить файл стандартного способа нет — открываем его папку
         open_file(hint)
     return {'ok': True}
 
@@ -1936,6 +2129,38 @@ def ask_folder(initial=''):
     return pick_folder(initial)
 
 
+def ask_file():
+    """Диалог выбора программы (плеера): в своём окне — диалог окна, в браузере — tkinter. Пусто — отменён."""
+    start = {'win': r'C:\Program Files', 'mac': '/Applications'}.get(OS_NAME, '/usr/bin')
+    w = WIN['window']
+    if w is not None:
+        try:
+            import webview
+            kind = getattr(getattr(webview, 'FileDialog', None), 'OPEN', None)
+            if kind is None:
+                kind = webview.OPEN_DIALOG
+            types = ('Programs (*.exe)', 'All files (*.*)') if os.name == 'nt' else ()
+            r = w.create_file_dialog(kind, directory=start, file_types=types)
+            if isinstance(r, (list, tuple)):
+                r = r[0] if r else ''
+            return r or ''
+        except Exception as e:  # noqa: BLE001 — не вышло диалогом окна: пробуем tkinter
+            print('The window dialog did not open (%s: %s), using the standard one.' % (type(e).__name__, e))
+    try:
+        import tkinter
+        from tkinter import filedialog
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        try:
+            types = [('Programs', '*.exe'), ('All files', '*.*')] if os.name == 'nt' else [('All files', '*')]
+            return filedialog.askopenfilename(title='Video player', initialdir=start, filetypes=types) or ''
+        finally:
+            root.destroy()
+    except Exception:  # noqa: BLE001 — нет tkinter или дисплея
+        return ''
+
+
 def switch_root(folder, previews=''):
     """Открыть другую папку без перезапуска программы.
 
@@ -2013,7 +2238,9 @@ LINKS = {  # внешние ссылки открываются только п�
     'monobank': 'https://send.monobank.ua/jar/6m4nBQCW9B',
     'kofi': 'https://ko-fi.com/commonfool',
     'crypto': 'https://nowpayments.io/donation/commonfool',
+    'mpc': 'https://github.com/clsid2/mpc-hc/releases',
 }
+ASSETS = {'exe': 'VSPO.exe', 'app': 'VSPO-mac.zip', 'appimage': 'VSPO-x86_64.AppImage'}  # файл релиза под каждый вид установки
 DONATE_DAYS = (7, 30)  # напоминание о донатах: обычно и после «Remind me less often»
 UPD = {'checked': 0, 'checking': False, 'error': '', 'latest': '', 'newer': False, 'page': '', 'notes': '',
        'asset': '', 'size': 0, 'digest': '', 'running': False, 'stage': '', 'done': 0, 'total': 0}
@@ -2030,6 +2257,17 @@ def http_get(url, timeout=20):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+def install_kind():
+    """Как установлена программа: exe (Windows), app (macOS), appimage (Linux), source (pairview.py) или '' — не знаем."""
+    if not getattr(sys, 'frozen', False):
+        return 'source'
+    if os.name == 'nt':
+        return 'exe'
+    if mac_bundle():
+        return 'app'
+    return 'appimage' if os.environ.get('APPIMAGE') else ''
+
+
 def check_update():
     """Последний релиз на GitHub: есть ли версия новее и exe к ней. Ошибки сети — в UPD['error']."""
     with ULOCK:
@@ -2039,7 +2277,8 @@ def check_update():
     try:
         with http_get('https://api.github.com/repos/%s/releases/latest' % REPO) as r:
             j = json.loads(r.read().decode('utf-8'))
-        exe = next((a for a in j.get('assets') or [] if str(a.get('name', '')).lower() == 'vspo.exe'), {})
+        want = ASSETS.get(install_kind(), '').lower()
+        exe = next((a for a in j.get('assets') or [] if str(a.get('name', '')).lower() == want), {})
         tag = str(j.get('tag_name') or '')
         with ULOCK:
             UPD.update(latest=tag, newer=vtuple(tag) > vtuple(VERSION), page=str(j.get('html_url') or LINKS['releases']),
@@ -2056,7 +2295,7 @@ def check_update():
 
 def update_status():
     with ULOCK:
-        return dict(UPD, version=VERSION, frozen=bool(getattr(sys, 'frozen', False)))
+        return dict(UPD, version=VERSION, kind=install_kind())
 
 
 def update_start():
@@ -2072,8 +2311,11 @@ def update_start():
             return
         if not UPD['newer']:
             raise Fail('no newer version', 409)
-        if getattr(sys, 'frozen', False) and not UPD['asset']:
-            raise Fail('the release has no VSPO.exe yet: try again in a few minutes', 409)
+        kind = install_kind()
+        if not kind:
+            raise Fail('this build cannot update itself: download the new version from the release page', 409)
+        if kind != 'source' and not UPD['asset']:
+            raise Fail('the release has no %s yet: try again in a few minutes' % ASSETS[kind], 409)
         UPD.update(running=True, stage='downloading', done=0, total=UPD['size'], error='')
     threading.Thread(target=update_worker, daemon=True).start()
 
@@ -2097,85 +2339,137 @@ def download(url, total=0):
     return bytes(buf), hashlib.sha256(buf).hexdigest()
 
 
+def check_digest(sha, digest):
+    if digest.startswith('sha256:') and digest[7:].lower() != sha:
+        raise RuntimeError('checksum mismatch')
+
+
 def update_worker():
+    kind, dst = install_kind(), ''
     try:
         with ULOCK:
             tag, asset, size, digest = UPD['latest'], UPD['asset'], UPD['size'], UPD['digest']
-        if getattr(sys, 'frozen', False):
-            dst = os.path.abspath(sys.executable)
-            data, sha = download(asset, size)
-            if data[:2] != b'MZ':
-                raise RuntimeError('the downloaded file is not a program')
-            if digest.startswith('sha256:') and digest[7:].lower() != sha:
-                raise RuntimeError('checksum mismatch')
-        else:
+        if kind == 'source':
             dst = os.path.abspath(__file__)
             data, _ = download('https://raw.githubusercontent.com/%s/%s/pairview.py' % (REPO, tag))
             compile(data, dst, 'exec')  # битый или чужой файл не ставим
             if b"APP = 'VSPO'" not in data:
                 raise RuntimeError('unexpected file')
+        else:
+            data, sha = download(asset, size)
+            check_digest(sha, digest)
+            magic = {'exe': b'MZ', 'app': b'PK', 'appimage': b'\x7fELF'}[kind]
+            if not data.startswith(magic):
+                raise RuntimeError('the downloaded file is not a %s' % ASSETS[kind])
+            dst = mac_bundle() if kind == 'app' else os.path.abspath(os.environ['APPIMAGE'] if kind == 'appimage' else sys.executable)
         with ULOCK:
             UPD['stage'] = 'installing'
-        new = dst + '.new'
-        with open(new, 'wb') as f:
-            f.write(data)
-        if getattr(sys, 'frozen', False):
-            # запущенный exe в Windows перезаписать нельзя, а переименовать можно: старый уходит в .old
-            old = dst + '.old'
-            if os.path.exists(old):
-                os.remove(old)
-            os.rename(dst, old)
-            try:
-                os.rename(new, dst)
-            except OSError:
-                os.rename(old, dst)
-                raise
+        if kind == 'app':
+            install_app(dst, data)
         else:
-            os.replace(new, dst)
+            new = dst + '.new'
+            with open(new, 'wb') as f:
+                f.write(data)
+            if kind == 'appimage':
+                os.chmod(new, 0o755)
+            if kind == 'exe':
+                # запущенный exe в Windows перезаписать нельзя, а переименовать можно: старый уходит в .old
+                old = dst + '.old'
+                if os.path.exists(old):
+                    os.remove(old)
+                os.rename(dst, old)
+                try:
+                    os.rename(new, dst)
+                except OSError:
+                    os.rename(old, dst)
+                    raise
+            else:  # pairview.py и AppImage: в Linux и macOS запущенный файл заменяется переименованием поверх
+                os.replace(new, dst)
         with ULOCK:
             UPD['stage'] = 'restarting'
         print('Updated to %s, restarting.' % tag)
-        threading.Thread(target=restart, daemon=True).start()
+        threading.Thread(target=restart, args=(dst,), daemon=True).start()
     except Exception as e:  # noqa: BLE001
-        try:
-            os.remove(dst + '.new')
-        except (OSError, NameError):
-            pass
+        if dst and kind != 'app':
+            try:
+                os.remove(dst + '.new')
+            except OSError:
+                pass
         with ULOCK:
-            UPD.update(running=False, stage='', error=str(e))
+            UPD.update(running=False, stage='',
+                       error=('no permission to replace ' + dst) if isinstance(e, PermissionError) else str(e))
         print('Update failed:', e)
 
 
-def restart():
+def install_app(app, data):
+    """macOS: распаковать VSPO.app рядом со старым (ditto сохраняет права и ссылки внутри приложения) и поменять местами.
+
+    Скачанное нами не получает отметку «из интернета», поэтому Gatekeeper новую версию не останавливает.
+    """
+    parent = os.path.dirname(app)
+    tmp = tempfile.mkdtemp(prefix='.vspo-update-', dir=parent)
+    try:
+        z = os.path.join(tmp, 'VSPO.zip')
+        with open(z, 'wb') as f:
+            f.write(data)
+        r = subprocess.run(['ditto', '-x', '-k', z, tmp], capture_output=True, text=True, timeout=300)
+        new = os.path.join(tmp, 'VSPO.app')
+        if r.returncode != 0 or not os.path.isdir(new):
+            raise RuntimeError('could not unpack the update: ' + (last_line(r.stderr) or 'no VSPO.app inside'))
+        old = app + '.old'
+        if os.path.exists(old):
+            shutil.rmtree(old, ignore_errors=True)
+        os.rename(app, old)
+        try:
+            os.rename(new, app)
+        except OSError:
+            os.rename(old, app)
+            raise
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def restart(dst=''):
     """Запустить новую версию с теми же параметрами и выйти. Ответ странице успевает уйти за секунду."""
     time.sleep(1.0)
     stop_job()
     env = dict(os.environ)
-    if getattr(sys, 'frozen', False):
-        cmd = [sys.executable] + sys.argv[1:]
-        # onefile-exe, запущенный из другого onefile-exe, иначе возьмёт его временную папку
-        env = {k: v for k, v in env.items() if not k.startswith(('_MEI', '_PYI'))}
-        env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
-    else:
+    kind = install_kind()
+    if kind == 'source':
         cmd = [sys.executable] + sys.argv
-    flags = 0x00000008 | 0x00000200 if os.name == 'nt' else 0  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        exe = dst or sys.executable
+        if kind == 'app':
+            exe = os.path.join(dst, 'Contents', 'MacOS', os.path.basename(sys.executable))
+        cmd = [exe] + sys.argv[1:]
+        # собранная программа, запущенная из другой собранной, иначе возьмёт её временную папку
+        env = {k: v for k, v in env.items() if not k.startswith(('_MEI', '_PYI', 'APPIMAGE', 'APPDIR', 'ARGV0', 'OWD'))}
+        env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+    if os.name == 'nt':
+        kw = {'creationflags': 0x00000008 | 0x00000200}  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        kw = {'start_new_session': True}
     try:
-        subprocess.Popen(cmd, env=env, cwd=base_dir(), close_fds=True, creationflags=flags)
+        subprocess.Popen(cmd, env=env, cwd=base_dir(), close_fds=True, **kw)
     except OSError as e:
         print('Could not restart:', e)
     os._exit(0)
 
 
-def cleanup_old_exe():
-    """После обновления остаётся VSPO.exe.old: старый процесс к этому времени уже вышел."""
-    if not getattr(sys, 'frozen', False):
+def cleanup_old():
+    """После обновления остаётся VSPO.exe.old (Windows) или VSPO.app.old (macOS): старый процесс к этому времени вышел."""
+    kind = install_kind()
+    if kind not in ('exe', 'app'):
         return
-    old = os.path.abspath(sys.executable) + '.old'
+    old = (mac_bundle() if kind == 'app' else os.path.abspath(sys.executable)) + '.old'
     for _ in range(10):
         if not os.path.exists(old):
             return
         try:
-            os.remove(old)
+            if os.path.isdir(old):
+                shutil.rmtree(old)
+            else:
+                os.remove(old)
             return
         except OSError:
             time.sleep(2)
@@ -2343,7 +2637,7 @@ class Handler(BaseHTTPRequestHandler):
                     files = mpc_files(b['ids'])
                 else:
                     files = folder_videos(str(b.get('dir') or ''), bool(b.get('deep')))
-                self.reply(200, send_to_mpc(files, bool(b.get('add'))))
+                self.reply(200, play(files, bool(b.get('add'))))
             elif post and p == ['api', 'delete-many']:
                 ids = self.jbody(raw).get('ids')
                 if not isinstance(ids, list):
@@ -2374,6 +2668,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, cut_start(int(b.get('id', -1)), b.get('cuts')))
             elif post and p == ['api', 'cut', 'stop']:
                 self.reply(200, cut_stop())
+            elif not post and p == ['api', 'player']:
+                self.reply(200, players_menu())
+            elif post and p == ['api', 'player', 'set']:
+                self.reply(200, choose_player(self.jbody(raw).get('id')))
+            elif post and p == ['api', 'player', 'pick']:
+                self.reply(200, pick_player())
             elif post and p == ['api', 'root', 'pick']:
                 self.reply(200, choose_root())
             elif post and p == ['api', 'root', 'recent']:
@@ -2407,7 +2707,7 @@ class Handler(BaseHTTPRequestHandler):
                 if p[1] == 'open':
                     if not g['v']:
                         raise LookupError('this preview has no video')
-                    open_file(g['v'][0][0], front=True)
+                    play([g['v'][0][0]])
                     self.reply(200, {'ok': True})
                 else:
                     delete_group(gid)
@@ -2673,6 +2973,19 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
 #rootl .dim{font-size:12px;word-break:break-all}
 #rootb{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
 #menup{width:280px;padding:6px}
+.prow{display:flex;gap:6px}
+.prow #fplay{flex:1;min-width:0;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#fact .prow button{width:auto}
+#fplr{flex:none;padding:5px 8px}
+#fplr svg{width:16px;height:16px}
+#pll{display:flex;flex-direction:column;gap:6px;margin:0 0 16px;max-height:50vh;overflow:auto}
+#pll button{display:flex;align-items:center;gap:12px;padding:9px 12px;text-align:left;border-radius:10px}
+#pll button.on{border-color:var(--acc);background:#25223a}
+#pll .rd{width:16px;height:16px;flex:none;border:2px solid var(--line2);border-radius:50%}
+#pll button.on .rd{border:5px solid var(--acc)}
+#pll .pn{flex:1;min-width:0}
+#pll .pn span{display:block;font-size:12px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#pll .badge{padding:1px 8px;border-radius:20px;background:#173c2d;color:var(--ok);font-size:12px;font-weight:600}
 #menup button{display:flex;align-items:center;gap:10px;width:100%;padding:8px 10px;text-align:left;background:none;border:0;border-radius:7px}
 #menup button:hover{background:var(--ctlh)}
 #menup button svg{width:16px;height:16px;flex:none;color:var(--dim)}
@@ -2728,7 +3041,7 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
     <span id="selcnt"></span>
     <button id="sdel" class="danger" title="Move the selected videos with their previews to _to_delete (Del). Ctrl+Z brings them all back"></button>
     <button id="sredo" title="Replace the previews of the selected videos with new ones"></button>
-    <button id="splay" title="Play the selected videos in MPC"></button>
+    <button id="splay" title="Play the selected videos in the video player"></button>
     <button id="sall" title="Select all previews in this list (Ctrl+A)">Select all</button>
     <button id="snone" title="Clear selection (Esc)">Clear selection</button>
   </div>
@@ -2747,6 +3060,7 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
 </div>
 <div id="menup" hidden>
   <button id="mupd"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-5-5m5 5l5-5M4 20h16"/></svg><span id="mupdt">Check for updates</span></button>
+  <button id="mplr"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l13-7.5z"/></svg><span id="mplrt">Video player</span></button>
   <button id="mdon"><svg style="color:#ff9db8" viewBox="0 0 24 24" fill="currentColor"><path d="M12 21s-7.5-4.6-9.6-9.2C1 8.6 3 5 6.6 5c2.1 0 3.6 1.1 5.4 3 1.8-1.9 3.3-3 5.4-3C21 5 23 8.6 21.6 11.8 19.5 16.4 12 21 12 21z"/></svg>Support the project</button>
   <button id="mkeys"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10" stroke-linecap="round"/></svg>Keyboard shortcuts</button>
   <button id="mgh"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2a10 10 0 00-3.2 19.5c.5.1.7-.2.7-.5v-1.7c-2.8.6-3.4-1.3-3.4-1.3-.5-1.2-1.1-1.5-1.1-1.5-.9-.6.1-.6.1-.6 1 .1 1.5 1 1.5 1 .9 1.5 2.4 1.1 2.9.8.1-.7.4-1.1.6-1.3-2.2-.3-4.6-1.1-4.6-5 0-1.1.4-2 1-2.7-.1-.3-.4-1.3.1-2.7 0 0 .8-.3 2.7 1a9.4 9.4 0 015 0c1.9-1.3 2.7-1 2.7-1 .5 1.4.2 2.4.1 2.7.6.7 1 1.6 1 2.7 0 3.9-2.4 4.7-4.6 5 .4.3.7.9.7 1.9V21c0 .3.2.6.7.5A10 10 0 0012 2z"/></svg>Project page on GitHub</button>
@@ -2766,7 +3080,7 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
     <label class="deep"><input type="checkbox" id="deep"> include subfolders</label>
     <div id="fact">
       <button id="fexp" title="Open the selected folder in Explorer">Open in Explorer</button>
-      <button id="fplay">Play in MPC</button>
+      <div class="prow"><button id="fplay">Play</button><button id="fplr" class="ib" title="Choose the video player"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.8-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.8 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.8.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.8V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg></button></div>
       <button id="fmpc">Add to MPC playlist</button>
     </div>
     <div id="fact2">
@@ -2824,7 +3138,7 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
     <button id="pdir" title="Previous folder ([)">Prev. folder</button>
     <button id="ndir" title="Next folder (])">Next folder</button>
     <button id="vpk" title="Select for bulk actions (X)">Select (X)</button>
-    <button id="vopen" title="Open video (Enter)">Open video</button>
+    <button id="vopen" title="Open in the video player (Enter)">Open video</button>
     <button id="vcut" title="Cut unwanted parts: the start, the end or pieces in the middle (C)">Trim video</button>
     <button id="vdel" class="del" title="Delete the video with its preview (Del)">Delete video</button>
     <button id="vclose" title="Close (Esc). The I key hides this bar">Close</button>
@@ -2857,14 +3171,20 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
     <div id="updbar" class="bar" hidden><i id="updi"></i></div>
     <div class="acts"><button id="updnotes" hidden>Release page</button><button id="updclose">Close</button><button id="updgo" class="go" hidden>Update and restart</button></div>
   </div>
+  <div id="plp" class="sheet" hidden>
+    <h2>Video player</h2>
+    <p id="plt" class="dim"></p>
+    <div id="pll"></div>
+    <div class="acts"><button id="plmpc" hidden>Get MPC-HC</button><button id="plpick">Choose another program…</button><button id="plclose" class="go">Close</button></div>
+  </div>
   <div id="keyp" class="sheet" hidden>
     <h2>Keyboard shortcuts</h2>
     <div class="keys">
       <h3>Gallery</h3>
       <span><kbd>←</kbd> <kbd>→</kbd> <kbd>↑</kbd> <kbd>↓</kbd> <kbd>Home</kbd> <kbd>End</kbd></span><span>select a preview</span>
       <span><kbd>Space</kbd></span><span>full screen view</span>
-      <span><kbd>Enter</kbd></span><span>open the video</span>
-      <span><kbd>E</kbd></span><span>show the file in Explorer</span>
+      <span><kbd>Enter</kbd></span><span>open the video in the player</span>
+      <span><kbd>E</kbd></span><span id="kexp">show the file in Explorer</span>
       <span><kbd>Del</kbd></span><span>delete the video (or all selected)</span>
       <span><kbd>[</kbd> <kbd>]</kbd> <kbd>PgUp</kbd> <kbd>PgDn</kbd></span><span>previous / next folder</span>
       <span><kbd>X</kbd> <kbd>Ctrl+A</kbd></span><span>select / select all</span>
@@ -2919,7 +3239,7 @@ let ff = {ok: true, drawtext: true};
 let trashInfo = {files: 0, bytes: 0};
 let jobTimer = 0, wasRunning = false, lastFail = 0;
 let ign = {exts: [], files: 0};
-let mpc = {ok: false, name: ''};
+let player = {ok: true, name: 'default app', add: false, os: 'win'};
 let picked = new Set(), anchor = -1;   // выделенные плитки (номера пар) и опорная плитка для Shift+клик
 let opts = {cols: 10, rows: 9, width: 2560, header: false, hw: ''};
 let refreshing = false;
@@ -3543,7 +3863,7 @@ async function load(focusId) {
   const j = await api('/api/list');
   all = j.items; videos = j.videos; undoN = j.undo; ROOT = j.root; ROOT_PATH = j.rootPath; recent = j.recent || [];
   rootStat();
-  trashInfo = j.trash; ff = j.ff; job = j.job; ign = j.ign || ign; opts = j.opts || opts; mpc = j.mpc || mpc;
+  trashInfo = j.trash; ff = j.ff; job = j.job; ign = j.ign || ign; opts = j.opts || opts; player = j.player || player; osLabels();
   if (!skipLoaded) {
     skipLoaded = true;
     try { skipDirs = new Set(JSON.parse(store.get('skip') || '[]')); } catch (_) { /* пусто */ }
@@ -4132,19 +4452,21 @@ function ask(text, okLabel) {
 const videoCount = () => all.filter(inView).reduce((s, i) => s + i.nv, 0) + videos.filter(inView).length;
 function folderStat() {
   $('#fdel').disabled = !folder;
-  const n = videoCount(), name = mpc.name || 'MPC';
-  const tip = mpc.ok ? '' : 'MPC not found: set its path with --player or in pairview.json';
+  const n = videoCount(), name = player.name;
   const p = $('#fplay'), b = $('#fmpc');
   p.textContent = 'Play in ' + name + ' (' + n + ')';
   p.disabled = b.disabled = !n;
-  p.title = tip || 'Play all videos of the selected folder' + (deep ? ' and its subfolders' : '') + ' in ' + name +
-    ': the playlist is replaced and playback starts at once (like "Play with MPC-HC" in Explorer)';
-  b.title = tip || 'Append the videos to the ' + name + ' playlist without starting playback (like "Add to playlist")';
+  p.title = 'Play all videos of the selected folder' + (deep ? ' and its subfolders' : '') + ' in ' + name +
+    (player.add ? ': the playlist is replaced and playback starts at once (like "Play with MPC-HC" in Explorer)' : '');
+  b.hidden = !player.add;
+  b.textContent = 'Add to ' + name + ' playlist';
+  b.title = 'Append the videos to the ' + name + ' playlist without starting playback (like "Add to playlist")';
+  $('#mplrt').textContent = 'Video player: ' + name;
 }
 async function mpcSend(body, add) {
   try {
     const r = await api('/api/mpc', true, Object.assign({add}, body));
-    toast((add ? 'Added to the ' + mpc.name + ' playlist: ' : 'Playing in ' + mpc.name + ', videos: ') + r.added +
+    toast((add ? 'Added to the ' + player.name + ' playlist: ' : 'Playing in ' + player.name + ', videos: ') + r.added +
       (r.calls > 1 ? ' (in several calls: long list)' : ''));
   } catch (e) {
     toast('Failed: ' + e.message, true);
@@ -4174,7 +4496,8 @@ function pickStat() {
   $('#sdel').textContent = 'Delete (' + n + ')';
   $('#sredo').textContent = 'Recreate previews (' + withVideo + ')';
   $('#sredo').disabled = !withVideo || job.running || !ff.ok;
-  $('#splay').textContent = 'Play in MPC (' + withVideo + ')';
+  $('#splay').textContent = 'Play (' + withVideo + ')';
+  $('#splay').title = 'Play the selected videos in ' + player.name;
   $('#splay').disabled = !withVideo;
   if (viewer && items[cur]) $('#vpk').textContent = picked.has(items[cur].id) ? '✓ Selected' : 'Select (X)';
 }
@@ -4291,6 +4614,66 @@ $('#fempty').onclick = async () => {
   }
 };
 
+/* ───── видеоплеер: выбор из установленных ───── */
+
+const OSL = {
+  win: ['Open in Explorer', 'Open the selected folder in Explorer', 'show the file in Explorer'],
+  mac: ['Show in Finder', 'Open the selected folder in Finder', 'show the file in Finder'],
+  linux: ['Open folder', 'Open the selected folder in the file manager', 'open the folder of the file'],
+};
+function osLabels() {
+  const l = OSL[player.os] || OSL.win;
+  $('#fexp').textContent = l[0];
+  $('#fexp').title = l[1];
+  $('#kexp').textContent = l[2];
+}
+let plData = null;
+function plRender() {
+  const d = plData;
+  $('#plt').textContent = d.os === 'win'
+    ? 'MPC-HC is recommended: only with it the gallery can add videos to the playlist and bring the player window to the front. Other players just play.'
+    : 'The player opens the video, or a playlist of all videos when you play a folder or a selection.';
+  $('#pll').innerHTML = d.players.map((x, i) => '<button data-i="' + i + '" class="' + (x.id === d.current ? 'on' : '') + '">' +
+    '<span class="rd"></span><span class="pn">' + esc(x.name) + '<span>' + esc(x.path) + '</span></span>' +
+    (x.rec ? '<span class="badge">recommended</span>' : '') + '</button>').join('');
+  $('#plmpc').hidden = d.os !== 'win' || d.mpc;
+}
+async function playerSheet() {
+  try { plData = await api('/api/player'); } catch (e) { toast('Failed: ' + e.message, true); return; }
+  plRender();
+  sheet('plp');
+}
+function playerSet(r) {
+  player = Object.assign(player, r);
+  if (plData) plData.current = r.path !== undefined ? r.path : plData.current;
+  folderStat();
+  pickStat();
+}
+$('#fplr').onclick = playerSheet;
+$('#mplr').onclick = playerSheet;
+$('#plclose').onclick = closeSheet;
+$('#plmpc').onclick = () => link('mpc');
+$('#pll').onclick = async e => {
+  const b = e.target.closest('button[data-i]');
+  if (!b) return;
+  const x = plData.players[+b.dataset.i];
+  try {
+    playerSet(await api('/api/player/set', true, {id: x.id}));
+    plData.current = x.id;
+    plRender();
+  } catch (err) { toast('Failed: ' + err.message, true); }
+};
+$('#plpick').onclick = async () => {
+  try {
+    const r = await api('/api/player/pick', true);
+    if (!r.ok) return;
+    playerSet(r);
+    plData = await api('/api/player');
+    plRender();
+  } catch (err) { toast('Failed: ' + err.message, true); }
+};
+osLabels();
+
 /* ───── меню: обновление с GitHub, поддержка проекта, клавиши ───── */
 
 let upd = {};
@@ -4346,13 +4729,14 @@ function updStat() {
       : upd.stage === 'installing' ? 'Installing…' : 'Restarting VSPO…')
     : upd.checking ? 'Checking GitHub…'
     : upd.error ? 'Update failed: ' + upd.error
+    : upd.newer && !upd.kind ? 'You have v' + upd.version + '. This build cannot update itself: download the new version from the release page.'
     : upd.newer ? 'You have v' + upd.version + '. The new version will be downloaded from GitHub, then VSPO restarts with the same folder.'
     : upd.latest ? 'You have the latest version, v' + upd.version + '.' : 'You have v' + upd.version + '.';
   $('#updn').textContent = upd.notes || '';
   $('#updn').hidden = !upd.newer || !upd.notes || upd.running;
   $('#updbar').hidden = !upd.running;
   $('#updi').style.width = (upd.stage === 'downloading' ? pct : 100) + '%';
-  $('#updgo').hidden = !upd.newer || upd.running;
+  $('#updgo').hidden = !upd.newer || upd.running || !upd.kind;
   $('#updnotes').hidden = !upd.newer || upd.running;
   $('#updclose').hidden = upd.running;
 }
@@ -4412,6 +4796,12 @@ def die(msg):
             ctypes.windll.user32.MessageBoxW(0, str(msg), APP, 0x10)
         except Exception:  # noqa: BLE001
             pass
+    elif mac_bundle():  # приложение из Finder: консоли тоже нет
+        text = str(msg).replace('\\', '\\\\').replace('"', '\\"')
+        try:
+            subprocess.run(['osascript', '-e', 'display alert "%s" message "%s" as critical' % (APP, text)], timeout=600)
+        except (OSError, subprocess.SubprocessError):
+            pass
     sys.exit(1)
 
 
@@ -4467,8 +4857,9 @@ def pick_folder(initial=''):
 def main():
     global ROOT_NAME, VROOT, PROOT
     setup_log()
+    fix_env()
     ap = argparse.ArgumentParser(description=APP + ' (Video Streams Preview Organizer): browse previews, delete videos, '
-                                             'create previews, play in MPC.')
+                                             'create previews, play in a video player.')
     ap.add_argument('--version', action='version', version='%s %s' % (APP, VERSION))
     ap.add_argument('folder', nargs='?',
                     help='folder with videos (and previews, if they are stored together); subfolders are included. '
@@ -4482,8 +4873,8 @@ def main():
     ap.add_argument('--ffmpeg', metavar='PATH', help='path to ffmpeg (file or folder) if it is not in PATH')
     ap.add_argument('--font', metavar='PATH', help='.ttf font file for the timestamps on previews')
     ap.add_argument('--player', metavar='PATH',
-                    help='path to mpc-hc64.exe / mpc-be64.exe for the MPC buttons '
-                         '(by default MPC-HC from K-Lite and standard folders are searched)')
+                    help='video player (mpc-hc64.exe, vlc, mpv, an .app on macOS…) until one is chosen in the menu '
+                         '(by default MPC-HC on Windows, otherwise the first installed player found)')
     ap.add_argument('--cols', type=int, default=10, help='frame columns in a preview (default 10)')
     ap.add_argument('--rows', type=int, default=9, help='frame rows in a preview (default 9)')
     ap.add_argument('--width', type=int, default=2560, help='preview width in pixels (default 2560, for a 2K monitor)')
@@ -4555,9 +4946,14 @@ def main():
     GPU['mode'] = a.gpu
     FAST['on'] = not a.per_frame
     detect_ff(a.ffmpeg, a.font)
-    PLAYER['path'] = find_player(a.player)
-    if a.player and not PLAYER['path']:
+    hint = find_player(a.player) if a.player else ''
+    if a.player and not hint:
         print('Warning: the player from --player was not found: %s' % a.player)
+    saved = saved_player()  # выбор в меню важнее --player: его сделали позже и осознанно
+    if saved is not None and (saved == '' or os.path.exists(saved)):
+        set_player(saved)
+    else:
+        set_player(hint or auto_player())
     wanted = {'.' + x.strip().lstrip('.').lower()
               for x in a.ignore_ext.replace(';', ',').replace(' ', ',').split(',') if x.strip().strip('.')}
     if wanted - VIDEO:
@@ -4608,11 +5004,11 @@ def main():
         print('Video decoding: ' + gpu_info())
     else:
         print('ffmpeg not found — preview creation is unavailable (see the hint in the interface).')
-    print('Player: ' + (PLAYER['path'] or 'MPC not found (the MPC buttons will not work; see --player)'))
+    print('Player: %s%s' % (PLAYER['name'], ' (%s)' % PLAYER['path'] if PLAYER['path'] else ''))
     for gid, key in enumerate(sorted(groups)):
         GROUPS[gid] = groups[key]
     IDS['next'] = len(groups)
-    threading.Thread(target=cleanup_old_exe, daemon=True).start()
+    threading.Thread(target=cleanup_old, daemon=True).start()
     refresh_trash_stats()  # счёт файлов в _на_удаление идёт в фоне: по сети он может занять минуты
     try:
         srv = Server(('127.0.0.1', a.port), Handler)

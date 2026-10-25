@@ -1,4 +1,4 @@
-name: Build exe
+name: Build
 
 on:
   push:
@@ -7,15 +7,15 @@ on:
   workflow_dispatch:
     inputs:
       release:
-        description: 'Release tag (e.g. v1.0); empty — build only'
+        description: 'Release tag (e.g. v1.2); empty — build only'
         required: false
         default: ''
 
 permissions:
-  contents: write  # для выкладки exe в релиз по тегу v*
+  contents: write  # для выкладки сборок в релиз по тегу v*
 
 jobs:
-  build:
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,14 +30,6 @@ jobs:
       - name: Check syntax
         run: python -m py_compile pairview.py
 
-      - name: Check that the release tag matches VERSION
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.release != ''
-        shell: bash
-        run: |
-          tag='${{ inputs.release || github.ref_name }}'
-          ver=$(python -c "import re; print(re.search(r\"^VERSION = '([^']+)'\", open('pairview.py', encoding='utf-8').read(), re.M).group(1))")
-          if [ "$tag" != "v$ver" ]; then echo "Tag $tag does not match VERSION = '$ver' in pairview.py"; exit 1; fi
-
       - name: Build VSPO.exe
         run: >
           pyinstaller --onefile --noconsole --name VSPO --icon assets/vspo.ico
@@ -45,14 +37,95 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: VSPO
+          name: VSPO-windows
           path: dist/VSPO.exe
 
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.release != ''
-        uses: softprops/action-gh-release@v2
+  macos:
+    runs-on: macos-latest  # Apple Silicon (arm64)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyInstaller, pywebview and Pillow (Pillow makes .icns from the PNG icon)
+        run: python -m pip install --upgrade pip pyinstaller pywebview pillow
+
+      - name: Build VSPO.app
+        run: >
+          pyinstaller --windowed --name VSPO --icon assets/vspo.png
+          --osx-bundle-identifier io.github.common-fool.vspo --collect-all webview pairview.py
+
+      - name: Pack VSPO-mac.zip
+        # ditto сохраняет права и символические ссылки внутри .app (обычный zip их теряет)
+        run: ditto -c -k --keepParent dist/VSPO.app VSPO-mac.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VSPO-macos
+          path: VSPO-mac.zip
+
+  linux:
+    runs-on: ubuntu-22.04  # старая glibc: AppImage запустится и на дистрибутивах постарше
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Tk (folder dialog in the browser mode) and PyInstaller
+        run: |
+          sudo apt-get update && sudo apt-get install -y tk
+          python -m pip install --upgrade pip pyinstaller
+          python -c "import tkinter" || echo "::warning::no tkinter: the folder dialog will not work in the AppImage"
+
+      # без pywebview: WebKitGTK внутрь AppImage толком не упаковывается, AppImage открывает галерею в браузере
+      - name: Build
+        run: pyinstaller --onedir --name VSPO pairview.py
+
+      - name: Pack VSPO-x86_64.AppImage
+        run: |
+          mkdir -p AppDir/usr/lib
+          cp -r dist/VSPO AppDir/usr/lib/vspo
+          printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/lib/vspo/VSPO" "$@"\n' > AppDir/AppRun
+          chmod +x AppDir/AppRun
+          printf '[Desktop Entry]\nType=Application\nName=VSPO\nComment=Video Streams Preview Organizer\nExec=VSPO\nIcon=vspo\nCategories=AudioVideo;Video;\nTerminal=false\n' > AppDir/vspo.desktop
+          cp assets/vspo.png AppDir/vspo.png
+          cp assets/vspo.png AppDir/.DirIcon
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run AppDir VSPO-x86_64.AppImage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VSPO-linux
+          path: VSPO-x86_64.AppImage
+
+  release:
+    needs: [windows, macos, linux]
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.release != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that the release tag matches VERSION
+        run: |
+          tag='${{ inputs.release || github.ref_name }}'
+          ver=$(python3 -c "import re; print(re.search(r\"^VERSION = '([^']+)'\", open('pairview.py', encoding='utf-8').read(), re.M).group(1))")
+          if [ "$tag" != "v$ver" ]; then echo "Tag $tag does not match VERSION = '$ver' in pairview.py"; exit 1; fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release || github.ref_name }}
           target_commitish: ${{ github.sha }}
           name: VSPO ${{ inputs.release || github.ref_name }}
-          files: dist/VSPO.exe
+          files: |
+            dist/VSPO-windows/VSPO.exe
+            dist/VSPO-macos/VSPO-mac.zip
+            dist/VSPO-linux/VSPO-x86_64.AppImage

@@ -5,8 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # VSPO (pairview.py)
 
 Один файл `pairview.py` (~4200 строк, Python 3.8+, только стандартная библиотека; `pywebview` и `ffmpeg` — внешние, необязательные).
-Программа для Windows: галерея превью-листов («contact sheets» с таймкодами) к видео. Ходит по папке и подпапкам, связывает видео и превью по имени,
-даёт парное удаление, групповые действия, создание недостающих превью через ffmpeg, запуск в MPC-HC, открытие в проводнике.
+Программа для Windows (основная система владельца), работает и на macOS/Linux: галерея превью-листов («contact sheets» с таймкодами) к видео. Ходит по папке и подпапкам, связывает видео и превью по имени,
+даёт парное удаление, групповые действия, создание недостающих превью через ffmpeg, запуск в выбранном видеоплеере (рекомендуем MPC-HC), открытие в проводнике.
 Название — VSPO (Video Streams Preview Organizer), константа `APP`. Интерфейс — локальный веб-сервер + страница (HTML/CSS/JS лежат внутри строки `PAGE`). Открывается в собственном окне (pywebview/WebView2) или в браузере.
 
 ## Договорённости с владельцем (важно, соблюдать)
@@ -33,15 +33,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | файловые операции | `move()`, `explain()`, `trash_dst()`, `delete_group()`, `delete_batch()`, `undo_last()`, `rescan()`, `new_id()`, `listing()` |
 | запуск программ и вывод окна вперёд | `pick_window()`, `list_windows()`, `raise_window()`, `bring_to_front()`, `open_file()` |
 | папка «на удаление» | `TSTAT`, `refresh_trash_stats()`, `trash_stats()`, `purge()`, `open_trash()` |
-| настройки, плеер MPC, проводник | `base_dir()`, `app_dir()`, `load/save_settings()`, `find_player()`, `folder_videos()`, `send_to_mpc()`, `show_in_explorer()`, `inside_root()` |
+| настройки, видеоплеер, проводник | `base_dir()`, `mac_bundle()`, `fix_env()`, `app_dir()`, `load/save_settings()`, `find_player()`, `list_players()`, `set_player()`, `play()`, `send_to_mpc()`, `folder_videos()`, `show_in_explorer()`, `inside_root()` |
 | удаление папок | `find_empty_dirs()`, `trash_folder()`, `folder_info()`, `delete_folder()`, `delete_empty()` |
 | создание превью (ffmpeg) | `detect_ff()`, `probe()`, `extract_batch()`, `make_preview()`, очередь `start_job()`/`worker()`/`stop_job()`, `JOB`, `GPU`, `FAST` |
 | HTTP | `Handler.dispatch()` (весь API), `Server` |
 | своё окно | `run_window()`, `WindowApi` (pywebview) |
 | страница | `PAGE = r"""..."""` — весь интерфейс |
 | обрезка видео | `CUT`, `AFTER`, `ff_call()`, `cut_info()`, `key_before()`, `cut_frame()`, `cut_regions()`/`cut_plan()`, `cut_start()`/`cut_worker()`/`cut_stop()` |
-| смена открытой папки | `WIN`, `ask_folder()`, `switch_root()`, `choose_root()` |
-| обновление с GitHub и поддержка проекта | `VERSION`, `REPO`, `LINKS`, `UPD`, `check_update()`, `update_start()`/`update_worker()`, `restart()`, `cleanup_old_exe()`, `donate_due()`, `open_link()` |
+| смена открытой папки | `WIN`, `ask_folder()`, `ask_file()`, `switch_root()`, `choose_root()` |
+| обновление с GitHub и поддержка проекта | `VERSION`, `REPO`, `LINKS`, `ASSETS`, `UPD`, `install_kind()`, `check_update()`, `update_start()`/`update_worker()`, `install_app()`, `restart()`, `cleanup_old()`, `donate_due()`, `open_link()` |
 | запуск | `main()`, `load_config()`, `setup_log()`, `die()`, `pick_folder()` |
 
 ## Модель данных
@@ -116,11 +116,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `VERSION` — версия программы; тег релиза должен быть `v` + `VERSION` (сборка релиза это проверяет и падает при расхождении). Перед новым релизом поднять `VERSION`.
 - Проверка: `check_update()` — `api.github.com/repos/<REPO>/releases/latest` (urllib, без ключа), один раз за запуск в фоне (по первому `GET /api/app`)
   и по кнопке в меню. Есть новее — зелёная точка на кнопке меню (☰) и пункт «Update to vX.Y».
-- Установка (`update_worker`): exe — скачать `VSPO.exe` из релиза (проверка размера, `MZ`, sha256 из поля `digest`, если GitHub его дал) →
-  запущенный exe переименовать в `VSPO.exe.old` (перезаписать его в Windows нельзя, переименовать можно) → новый на его место.
-  Из исходников — скачать `pairview.py` с тега (проверка `compile`) и `os.replace`. Потом `restart()`: тот же набор параметров,
-  у onefile-exe — `PYINSTALLER_RESET_ENVIRONMENT=1` и без `_MEI*`/`_PYI*` в окружении; затем `os._exit(0)`.
-  `VSPO.exe.old` удаляет следующий запуск (`cleanup_old_exe`). Нельзя во время создания превью и обрезки.
+- Вид установки — `install_kind()`: `exe` (Windows), `app` (macOS, `VSPO.app`), `appimage` (Linux, переменная `APPIMAGE`), `source` (pairview.py),
+  `''` — собрано как-то иначе, самообновления нет (страница предлагает скачать вручную). Файл релиза под каждый вид — `ASSETS`.
+- Установка (`update_worker`): скачать файл релиза (проверка размера, сигнатуры `MZ`/`PK`/ELF, sha256 из поля `digest`, если GitHub его дал).
+  exe — запущенный exe переименовать в `VSPO.exe.old` (перезаписать его в Windows нельзя, переименовать можно) → новый на его место.
+  app — `install_app()`: `ditto -x -k` во временную папку рядом с .app (ditto сохраняет права и ссылки), старое приложение → `VSPO.app.old`, новое на место;
+  скачанное нами не помечается карантином, Gatekeeper обновление не останавливает. AppImage и pairview.py (скачивается с тега, проверка `compile`) —
+  `os.replace` поверх (в Linux/macOS запущенный файл так заменить можно). Потом `restart()`: тот же набор параметров, у собранных —
+  `PYINSTALLER_RESET_ENVIRONMENT=1` и без `_MEI*`/`_PYI*`/`APPIMAGE*` в окружении; затем `os._exit(0)`.
+  `.old` удаляет следующий запуск (`cleanup_old`). Нельзя во время создания превью и обрезки.
 - Внешние ссылки — только по имени из `LINKS` (`POST /api/link {name}`), открываются браузером по умолчанию: в окне pywebview `<a target=_blank>` ненадёжен.
 - Донаты: кнопка «Support» в шапке и пункт меню → окно с Monobank, Ko-fi, NOWPayments и QR (SVG банки Monobank, встроен в `PAGE`).
   Напоминание при запуске: раз в неделю, после «Remind me less often» — раз в месяц (`DONATE_DAYS`); о частоте в интерфейсе не писать.
@@ -153,8 +157,17 @@ Del/Backspace — удалить пару (или все выбранные); `[
 F5/Ctrl+R — обновить список. В просмотре: ←/→ листать, I — скрыть нижнюю панель, C — обрезать видео, Esc, Space или клик по картинке — закрыть.
 В обрезке: ←/→ курсор на 1 с (Shift — 10 с, Ctrl — минута), Home/End, I/O — начало/конец куска, Del — убрать кусок, Esc — снять отметку/выделение/закрыть.
 
-## MPC и проводник
+## Видеоплеер и проводник
 
+- Плеер выбирается в меню (☰ → Video player) или шестерёнкой у «Play in …» в дереве: окно `#plp` со списком `list_players()`
+  (Windows: MPC-HC/BE, VLC, PotPlayer, mpv; macOS: IINA/VLC/mpv в Applications и mpv из PATH; Linux: mpv, vlc, celluloid, smplayer, haruna, mpc-qt),
+  «программа системы» (путь `''`) и «Choose another program…» (`ask_file()`, диалог на стороне сервера). Путь с клиента принимается только из этого списка.
+- `PLAYER = {path, name, kind}`; `kind == 'mpc'` только у MPC-HC/BE в Windows. Выбор хранится в settings.json (`player`, общий) и важнее `--player`;
+  не выбирали → `--player` → `auto_player()` (в Windows — MPC, иначе первый найденный, иначе программа системы).
+- `play(files, add)`: MPC → `send_to_mpc()` (ниже). Остальные — **только воспроизведение**: один файл — путем, несколько — плейлистом
+  `playlist.m3u8` в папке настроек (никаких ограничений длины командной строки); «Add to playlist» и вывод окна вперёд — только MPC
+  (кнопка «Add to … playlist» скрыта). macOS: `.app` запускается через `open -a`. Enter/«Open video» тоже идут через `play()`.
+- Показ в папке: Windows — `explorer /select,`; macOS — `open -R` (Finder с выделенным файлом); Linux — `xdg-open` папки. Подписи кнопок — по ОС (`osLabels()`).
 - `find_player()`: `--player` → `MPC_DEFAULT` (путь K-Lite выше) → стандартные папки → PATH. Подходит и MPC-BE.
 - `send_to_mpc(files, add)`: без `/add` — как «Play with MPC-HC» в проводнике (плейлист заменяется, воспроизведение сразу);
   с `/add` — дописывает в конец и **не** запускает воспроизведение. Файлы передаются списком (не папкой): не попадают игнорируемые `.ts`, порядок как в галерее.
@@ -175,7 +188,8 @@ F5/Ctrl+R — обновить список. В просмотре: ←/→ ли
 | GET | `/api/trash`, `/api/make` | счётчик корзины; статус создания превью |
 | GET | `/p/<id>` | картинка превью (читается целиком и файл сразу закрывается) |
 | POST | `/api/delete/<id>`, `/api/delete-many`, `/api/undo` | удаление пары, выбранных, отмена |
-| POST | `/api/open/<id>`, `/api/explorer`, `/api/mpc` | открыть видео, проводник, MPC |
+| POST | `/api/open/<id>`, `/api/explorer`, `/api/mpc` | открыть видео в плеере, проводник, играть/дописать в плейлист (`play()`) |
+| GET/POST | `/api/player`, `/api/player/set`, `/api/player/pick` | список плееров; выбрать из списка (`{id}`); указать программу диалогом |
 | POST | `/api/make`, `/api/make/stop` | создать/пересоздать превью (`{ids, redo}`), остановить |
 | POST | `/api/rescan`, `/api/orphans` | обновить список; убрать превью без видео |
 | POST | `/api/folder/info`, `/api/folder/delete`, `/api/empty`, `/api/empty/delete` | удаление папок |
@@ -214,11 +228,15 @@ pythonw.exe pairview.py "D:\Видео"     # без консоли (ярлык)
 | `--ignore-ext ts` | расширения видео, которые игнорировать (пусто — ничего) |
 | `--port N`, `--browser`, `--no-browser` | порт, браузер вместо окна, только сервер |
 
-## Сборка exe (PyInstaller, только на Windows)
+## Сборка (PyInstaller, GitHub Actions)
 
-Сборку делает GitHub Actions (`.github/workflows/build.yml`): при каждом push (и вручную — Run workflow) на `windows-latest`
-с Python 3.12 собирается `VSPO.exe` и выкладывается артефактом «VSPO» на странице запуска. Тег `v*` (например `v1.0`) дополнительно
-прикладывает exe к релизу; то же — ручной запуск с тегом в поле release (тег создаёт сам GitHub). Вручную на Windows:
+Сборку делает GitHub Actions (`.github/workflows/build.yml`, workflow «Build»): при каждом push (и вручную — Run workflow) три задачи с Python 3.12:
+`windows-latest` → `VSPO.exe` (onefile), `macos-latest` (arm64) → `VSPO.app` в `VSPO-mac.zip` (ditto), `ubuntu-22.04` → onedir без pywebview,
+упакованный appimagetool в `VSPO-x86_64.AppImage` (WebKitGTK в AppImage не упаковывается: AppImage открывает браузер). Артефакты `VSPO-windows`,
+`VSPO-macos`, `VSPO-linux`. Тег `v*` или ручной запуск с тегом в поле release → задача `release` сверяет тег с `VERSION` и выкладывает все три файла.
+macOS-приложение не подписано Apple: первый запуск — правый клик → Open или `xattr -cr`. Особенности собранных версий: `base_dir()` — рядом с .app /
+.AppImage; `fix_env()` — Homebrew в PATH на macOS, исходный `LD_LIBRARY_PATH` для дочерних процессов в Linux; `die()` на macOS — `osascript`.
+Вручную на Windows:
 
 ```
 pip install pyinstaller pywebview
@@ -253,8 +271,8 @@ pyinstaller --onefile --noconsole --name VSPO --icon assets/vspo.ico --collect-a
 ## Что не проверено на настоящем Windows
 
 pywebview/WebView2 и полноэкранный режим окна; вывод окна плеера вперёд; поведение `/add` и запуска в MPC владельца; NVDEC (`--gpu on`);
-скорость создания превью с NAS по SMB и работа режима пачек кадров; самообновление exe (подмена через `.old` и перезапуск onefile;
-из исходников проверено в Linux);  диалог выбора папки из окна pywebview
+скорость создания превью с NAS по SMB и работа режима пачек кадров; самообновление exe, .app и AppImage (из исходников проверено в Linux); сборки и запуск на macOS и Linux;
+выбор плеера (проверен в Linux с подставным mpv через API и в браузере);  диалог выбора папки из окна pywebview
 (`create_file_dialog` из потока HTTP; при сбое — tkinter). Смена папки через список недавних проверена через API и в браузере.
 Обрезка проверена на машине владельца с ffmpeg 8.1 на синтетических x264 mp4/mkv (API, покадрово, отмена, остановка; интерфейс — в браузере событиями из JS),
 но не проверена: на настоящих записях стримов и HEVC, по SMB с NAS (скорость `key_before`/кадров), мышью в окне pywebview.
