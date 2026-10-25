@@ -2003,6 +2003,221 @@ def choose_root(folder=None):
     return switch_root(path, previews or '')
 
 
+# ───────────────────────── обновление с GitHub и поддержка проекта ─────────────────────────
+
+VERSION = '1.1'  # перед тегом vX.Y поднять: сборка релиза сверяет тег с этой строкой
+REPO = 'Common-Fool/Video-Streams-Preview-Organizer'
+LINKS = {  # внешние ссылки открываются только по имени отсюда (браузером по умолчанию)
+    'github': 'https://github.com/' + REPO,
+    'releases': 'https://github.com/' + REPO + '/releases',
+    'monobank': 'https://send.monobank.ua/jar/6m4nBQCW9B',
+    'kofi': 'https://ko-fi.com/commonfool',
+    'crypto': 'https://nowpayments.io/donation/commonfool',
+}
+DONATE_DAYS = (7, 30)  # напоминание о донатах: обычно и после «Remind me less often»
+UPD = {'checked': 0, 'checking': False, 'error': '', 'latest': '', 'newer': False, 'page': '', 'notes': '',
+       'asset': '', 'size': 0, 'digest': '', 'running': False, 'stage': '', 'done': 0, 'total': 0}
+ULOCK = threading.Lock()
+
+
+def vtuple(tag):
+    return tuple(int(x) for x in re.findall(r'\d+', tag or ''))
+
+
+def http_get(url, timeout=20):
+    import urllib.request
+    req = urllib.request.Request(url, headers={'User-Agent': APP + '/' + VERSION, 'Accept': 'application/vnd.github+json'})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def check_update():
+    """Последний релиз на GitHub: есть ли версия новее и exe к ней. Ошибки сети — в UPD['error']."""
+    with ULOCK:
+        if UPD['checking']:
+            return
+        UPD['checking'] = True
+    try:
+        with http_get('https://api.github.com/repos/%s/releases/latest' % REPO) as r:
+            j = json.loads(r.read().decode('utf-8'))
+        exe = next((a for a in j.get('assets') or [] if str(a.get('name', '')).lower() == 'vspo.exe'), {})
+        tag = str(j.get('tag_name') or '')
+        with ULOCK:
+            UPD.update(latest=tag, newer=vtuple(tag) > vtuple(VERSION), page=str(j.get('html_url') or LINKS['releases']),
+                       notes=str(j.get('body') or '')[:3000], asset=str(exe.get('browser_download_url') or ''),
+                       size=int(exe.get('size') or 0), digest=str(exe.get('digest') or ''), error='')
+    except Exception as e:  # noqa: BLE001 — нет сети, лимит GitHub, странный ответ: проверка просто не удалась
+        with ULOCK:
+            UPD['error'] = 'could not reach GitHub (%s)' % (getattr(e, 'reason', None) or e)
+    finally:
+        with ULOCK:
+            UPD['checking'] = False
+            UPD['checked'] = time.time()
+
+
+def update_status():
+    with ULOCK:
+        return dict(UPD, version=VERSION, frozen=bool(getattr(sys, 'frozen', False)))
+
+
+def update_start():
+    """Скачать новую версию, подменить exe (или pairview.py) и перезапуститься."""
+    with JLOCK:
+        if JOB['running']:
+            raise Fail('previews are being created: wait until it finishes or stop it', 409)
+    with CLOCK:
+        if CUT['running']:
+            raise Fail('a video is being trimmed: wait until it finishes', 409)
+    with ULOCK:
+        if UPD['running']:
+            return
+        if not UPD['newer']:
+            raise Fail('no newer version', 409)
+        if getattr(sys, 'frozen', False) and not UPD['asset']:
+            raise Fail('the release has no VSPO.exe yet: try again in a few minutes', 409)
+        UPD.update(running=True, stage='downloading', done=0, total=UPD['size'], error='')
+    threading.Thread(target=update_worker, daemon=True).start()
+
+
+def download(url, total=0):
+    import hashlib
+    buf = bytearray()
+    with http_get(url, timeout=60) as r:
+        total = total or int(r.headers.get('Content-Length') or 0)
+        with ULOCK:
+            UPD['total'] = total
+        while True:
+            chunk = r.read(1 << 16)
+            if not chunk:
+                break
+            buf += chunk
+            with ULOCK:
+                UPD['done'] = len(buf)
+    if total and len(buf) != total:
+        raise RuntimeError('download incomplete')
+    return bytes(buf), hashlib.sha256(buf).hexdigest()
+
+
+def update_worker():
+    try:
+        with ULOCK:
+            tag, asset, size, digest = UPD['latest'], UPD['asset'], UPD['size'], UPD['digest']
+        if getattr(sys, 'frozen', False):
+            dst = os.path.abspath(sys.executable)
+            data, sha = download(asset, size)
+            if data[:2] != b'MZ':
+                raise RuntimeError('the downloaded file is not a program')
+            if digest.startswith('sha256:') and digest[7:].lower() != sha:
+                raise RuntimeError('checksum mismatch')
+        else:
+            dst = os.path.abspath(__file__)
+            data, _ = download('https://raw.githubusercontent.com/%s/%s/pairview.py' % (REPO, tag))
+            compile(data, dst, 'exec')  # битый или чужой файл не ставим
+            if b"APP = 'VSPO'" not in data:
+                raise RuntimeError('unexpected file')
+        with ULOCK:
+            UPD['stage'] = 'installing'
+        new = dst + '.new'
+        with open(new, 'wb') as f:
+            f.write(data)
+        if getattr(sys, 'frozen', False):
+            # запущенный exe в Windows перезаписать нельзя, а переименовать можно: старый уходит в .old
+            old = dst + '.old'
+            if os.path.exists(old):
+                os.remove(old)
+            os.rename(dst, old)
+            try:
+                os.rename(new, dst)
+            except OSError:
+                os.rename(old, dst)
+                raise
+        else:
+            os.replace(new, dst)
+        with ULOCK:
+            UPD['stage'] = 'restarting'
+        print('Updated to %s, restarting.' % tag)
+        threading.Thread(target=restart, daemon=True).start()
+    except Exception as e:  # noqa: BLE001
+        try:
+            os.remove(dst + '.new')
+        except (OSError, NameError):
+            pass
+        with ULOCK:
+            UPD.update(running=False, stage='', error=str(e))
+        print('Update failed:', e)
+
+
+def restart():
+    """Запустить новую версию с теми же параметрами и выйти. Ответ странице успевает уйти за секунду."""
+    time.sleep(1.0)
+    stop_job()
+    env = dict(os.environ)
+    if getattr(sys, 'frozen', False):
+        cmd = [sys.executable] + sys.argv[1:]
+        # onefile-exe, запущенный из другого onefile-exe, иначе возьмёт его временную папку
+        env = {k: v for k, v in env.items() if not k.startswith(('_MEI', '_PYI'))}
+        env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+    else:
+        cmd = [sys.executable] + sys.argv
+    flags = 0x00000008 | 0x00000200 if os.name == 'nt' else 0  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    try:
+        subprocess.Popen(cmd, env=env, cwd=base_dir(), close_fds=True, creationflags=flags)
+    except OSError as e:
+        print('Could not restart:', e)
+    os._exit(0)
+
+
+def cleanup_old_exe():
+    """После обновления остаётся VSPO.exe.old: старый процесс к этому времени уже вышел."""
+    if not getattr(sys, 'frozen', False):
+        return
+    old = os.path.abspath(sys.executable) + '.old'
+    for _ in range(10):
+        if not os.path.exists(old):
+            return
+        try:
+            os.remove(old)
+            return
+        except OSError:
+            time.sleep(2)
+
+
+def donate_due():
+    """Пора ли напомнить о поддержке. Первый запуск только назначает срок; напомнив, сразу назначаем следующий."""
+    with SLOCK:
+        d = read_all_settings()
+        s = d.get('donate') if isinstance(d.get('donate'), dict) else {}
+        now = time.time()
+        nxt = s.get('next') if isinstance(s.get('next'), (int, float)) else 0
+        due = bool(nxt) and now >= nxt
+        if not nxt or due:
+            s['next'] = now + DONATE_DAYS[bool(s.get('rare'))] * 86400
+            d['donate'] = s
+            try:
+                write_all_settings(d)
+            except OSError:
+                return False
+        return due
+
+
+def donate_rare():
+    """«Remind me less often»: дальше напоминаем реже."""
+    with SLOCK:
+        d = read_all_settings()
+        d['donate'] = {'rare': True, 'next': time.time() + DONATE_DAYS[1] * 86400}
+        try:
+            write_all_settings(d)
+        except OSError:
+            pass
+
+
+def open_link(name):
+    url = LINKS.get(str(name))
+    if not url:
+        raise Fail('unknown link')
+    webbrowser.open(url)
+    return {'ok': True}
+
+
 # ───────────────────────── HTTP ─────────────────────────
 
 MAX_BODY = 4 * 1024 * 1024
@@ -2084,6 +2299,23 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, trash_stats())
             elif not post and p == ['api', 'make']:
                 self.reply(200, job_status())
+            elif not post and p == ['api', 'app']:
+                if not UPD['checked'] and not UPD['checking']:
+                    threading.Thread(target=check_update, daemon=True).start()
+                self.reply(200, {'update': update_status(), 'donate': donate_due()})
+            elif not post and p == ['api', 'update']:
+                self.reply(200, update_status())
+            elif post and p == ['api', 'update', 'check']:
+                check_update()
+                self.reply(200, update_status())
+            elif post and p == ['api', 'update', 'start']:
+                update_start()
+                self.reply(200, update_status())
+            elif post and p == ['api', 'donate', 'rare']:
+                donate_rare()
+                self.reply(200, {'ok': True})
+            elif post and p == ['api', 'link']:
+                self.reply(200, open_link(self.jbody(raw).get('name')))
             elif not post and p[0] == 'p' and len(p) == 2:
                 self.image(int(p[1]))
             elif not post and p == ['api', 'cut']:
@@ -2248,7 +2480,7 @@ def run_window(url, title, width=1600, height=1000):
     api = WindowApi()
     try:
         win = webview.create_window(title, url, js_api=api, width=width, height=height, min_size=(900, 600),
-                                    background_color='#2b2b2b', text_select=True)
+                                    background_color='#111217', text_select=True)
         api._window = win
         WIN['window'] = win
         # на Windows принудительно WebView2: запасной движок IE страницу не потянет
@@ -2269,160 +2501,206 @@ PAGE = r"""<!doctype html>
 <title>VSPO</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%237c5cff'/%3E%3Cstop offset='1' stop-color='%231eaaff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='3' y='3' width='58' height='58' rx='14' fill='url(%23g)'/%3E%3Ccircle cx='32' cy='32' r='19' fill='%23fff'/%3E%3Cpath d='M26 22v20l16-10z' fill='%235476ff'/%3E%3C/svg%3E">
 <style>
-:root{color-scheme:dark;--bg:#2b2b2b;--cell:#363636;--well:#1e1e1e;--line:#474747;--text:#dcdcdc;--dim:#a0a0a0;--pick:#f2f2f2;--bad:#c9524e;--w:480px;--hh:52px}
+:root{color-scheme:dark;--bg:#111217;--panel:#17191f;--cell:#1c1f27;--cellh:#232733;--well:#0a0b0e;--line:#272a34;--line2:#363a47;
+  --ctl:#22252f;--ctlh:#2b2f3b;--text:#e7e9f0;--dim:#8c92a4;--acc:#8b7bff;--acc2:#1eaaff;--accg:linear-gradient(135deg,#7c5cff,#1e9bff);
+  --pick:#9d90ff;--bad:#e35d57;--badbg:#3a1f22;--ok:#3ecf8e;--r:8px;--w:480px;--hh:52px}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 "Segoe UI Variable Text","Segoe UI",system-ui,sans-serif}
+html{scrollbar-color:#3a3e4b var(--bg)}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 "Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+::-webkit-scrollbar{width:12px;height:12px}
+::-webkit-scrollbar-thumb{background:#33363f;border:3px solid transparent;border-radius:8px;background-clip:padding-box}
+::-webkit-scrollbar-thumb:hover{background-color:#454a57}
+::-webkit-scrollbar-track{background:transparent}
 .dim{color:var(--dim)}
-header{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;align-items:center;gap:8px 20px;padding:10px 16px;background:var(--bg);border-bottom:1px solid var(--line)}
-#cnt{font-weight:600}
+header{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:9px 14px;background:#15171dee;
+  backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+#logo{display:flex;align-items:center;gap:8px;margin-right:4px;font-weight:700;letter-spacing:.06em;user-select:none}
+#logo svg{width:24px;height:24px;display:block}
+#cnt{font-weight:600;color:var(--dim);font-variant-numeric:tabular-nums;margin:0 4px}
 label{display:flex;align-items:center;gap:8px;color:var(--dim)}
-button,select{font:inherit;color:var(--text);background:#3d3d3d;border:1px solid #5a5a5a;border-radius:5px;padding:5px 11px;cursor:pointer}
-button:hover:not(:disabled){background:#484848}
-button:disabled{opacity:.45;cursor:default}
-.del:hover:not(:disabled){border-color:var(--bad);color:#f1b9b6}
-:focus-visible{outline:2px solid var(--pick);outline-offset:2px}
-input[type=range]{width:140px;accent-color:var(--pick)}
-#keys{margin-left:auto;display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12px;color:var(--dim)}
-kbd{font:inherit;color:var(--text);padding:1px 6px;margin-right:4px;background:#383838;border:1px solid #555;border-bottom-width:2px;border-radius:4px}
+button,select{font:inherit;color:var(--text);background:var(--ctl);border:1px solid var(--line2);border-radius:var(--r);padding:5px 11px;cursor:pointer;
+  transition:background-color .12s,border-color .12s,color .12s}
+select{padding-right:8px}
+button:hover:not(:disabled),select:hover{background:var(--ctlh);border-color:#454a59}
+button:active:not(:disabled){transform:translateY(1px)}
+button:disabled{opacity:.4;cursor:default}
+.del:hover:not(:disabled){border-color:var(--bad);color:#ffb4ae}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+input[type=range]{width:110px;accent-color:var(--acc)}
+kbd{display:inline-block;min-width:22px;text-align:center;font-family:inherit;font-size:12px;line-height:1.5;color:var(--text);padding:0 6px;background:#262a35;border:1px solid #3a3f4d;border-bottom-width:2px;border-radius:5px}
+.sp{margin-left:auto}
+.ib{display:inline-flex;align-items:center;justify-content:center;gap:6px}
+.ib svg{width:16px;height:16px;flex:none}
+#donb{color:#ff9db8;border-color:#5a3346;background:#2a1d26}
+#donb:hover{background:#38222f;border-color:#7a3f5c}
+#menub{position:relative;padding:5px 9px}
+#menub.upd::after{content:'';position:absolute;right:3px;top:3px;width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 2px var(--panel)}
 
 #wrap{display:flex;align-items:flex-start}
 main{flex:1;min-width:0}
-#tree{flex:0 0 260px;position:sticky;top:var(--hh);max-height:calc(100vh - var(--hh));overflow:auto;padding:12px 10px 20px 12px;border-right:1px solid var(--line)}
+#tree{flex:0 0 264px;position:sticky;top:var(--hh);max-height:calc(100vh - var(--hh));overflow:auto;padding:14px 10px 20px 12px;background:var(--panel);border-right:1px solid var(--line);min-height:calc(100vh - var(--hh))}
 body.notree #tree{display:none}
 .deep{margin:0 0 10px;padding:0 8px}
-button.dir{display:flex;width:100%;align-items:center;gap:8px;margin:1px 0;padding:5px 8px;text-align:left;background:none;border:0;border-radius:5px}
-button.dir:hover:not(:disabled){background:#383838}
-button.dir.on{background:#4a4a4a;font-weight:600}
+button.dir{display:flex;width:100%;align-items:center;gap:8px;margin:1px 0;padding:5px 8px;text-align:left;background:none;border:0;border-radius:6px}
+button.dir:hover:not(:disabled){background:#22252e}
+button.dir.on{background:#2a2840;color:#fff;font-weight:600;box-shadow:inset 3px 0 0 var(--acc)}
 button.dir.zero{color:var(--dim)}
 button.dir.on.zero{font-weight:400}
 .dn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dc{font-size:12px;color:var(--dim)}
+.dc{font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums}
 #empty{margin:0;padding:28px 16px}
 
-#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(var(--w),100%),1fr));gap:14px;padding:16px}
-figure{margin:0;background:var(--cell);border-radius:6px;overflow:hidden;scroll-margin:calc(var(--hh) + 8px) 0 24px}
-figure.sel{outline:2px solid var(--pick);outline-offset:1px;background:#454545}
+#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(var(--w),100%),1fr));gap:16px;padding:18px}
+figure{margin:0;background:var(--cell);border:1px solid var(--line);border-radius:12px;overflow:hidden;scroll-margin:calc(var(--hh) + 8px) 0 24px;
+  transition:border-color .15s,box-shadow .15s,background-color .15s}
+figure:hover{border-color:#3a3e4c;box-shadow:0 6px 22px #0007}
+figure.sel{border-color:var(--pick);box-shadow:0 0 0 1px var(--pick),0 8px 26px #0009;background:var(--cellh)}
 figure.wait{opacity:.55}
-figure.bad,figure.bad.sel{outline:2px solid var(--bad);outline-offset:1px}
-.err{padding:7px 10px;background:#3b2523;color:#f3c1bd;font-size:12px;line-height:1.35}
+figure.bad,figure.bad.sel{border-color:var(--bad);box-shadow:0 0 0 1px var(--bad)}
+.err{padding:7px 10px;background:var(--badbg);color:#ffc2bd;font-size:12px;line-height:1.35}
 .im{position:relative;aspect-ratio:16/10;background:var(--well);cursor:zoom-in}
 .im img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
-.nov{position:absolute;right:8px;top:8px;padding:2px 8px;border-radius:4px;background:var(--bad);color:#fff;font-size:12px;font-weight:600}
-figcaption{padding:8px 10px 9px}
+.nov{position:absolute;right:8px;top:8px;padding:2px 9px;border-radius:20px;background:var(--bad);color:#fff;font-size:12px;font-weight:600}
+figcaption{padding:9px 12px 10px}
 .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
 .row{display:flex;align-items:center;gap:12px;min-height:30px;font-size:12px;color:var(--dim)}
 .bt{display:none;gap:6px;margin-left:auto}
 figure.sel .bt,figure:hover .bt{display:flex}
-.bt button{padding:3px 9px;font-size:12px}
+.bt button{padding:3px 10px;font-size:12px}
 
 #v{position:fixed;inset:0;z-index:10;display:flex;flex-direction:column;background:var(--well)}
 #v[hidden],#verr[hidden]{display:none}
 #vi{flex:1;min-height:0;width:100%;object-fit:contain}
-#vb{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;padding:10px 16px;background:var(--bg);border-top:1px solid var(--line)}
+#vb{display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;padding:10px 16px;background:var(--panel);border-top:1px solid var(--line)}
 body.nobar #vb{display:none}
-#verr{position:absolute;left:0;right:0;top:0;z-index:2;padding:10px 16px;background:#7a2f2b;color:#fff;font-weight:600}
+#verr{position:absolute;left:0;right:0;top:0;z-index:2;padding:10px 16px;background:#8a2f2b;color:#fff;font-weight:600}
 #v.wait #vi{opacity:.5}
 body.wait,body.wait *{cursor:progress}
 #vname{flex:1;min-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
 #vmeta{display:flex;gap:12px;color:var(--dim)}
-#cut{position:relative;padding:12px 16px 8px;background:#242424;border-top:1px solid var(--line)}
-#ctrack{position:relative;height:46px;border-radius:4px;background:#34503a;cursor:crosshair;touch-action:none;user-select:none}
-.creg{position:absolute;top:0;bottom:0;background:#a3403acc;border-left:2px solid #f07a72;border-right:2px solid #f07a72;cursor:pointer}
+#cut{position:relative;padding:12px 16px 8px;background:#14161c;border-top:1px solid var(--line)}
+#ctrack{position:relative;height:46px;border-radius:6px;background:#1f4a3a;cursor:crosshair;touch-action:none;user-select:none}
+.creg{position:absolute;top:0;bottom:0;background:#b8403acc;border-left:2px solid #ff7d74;border-right:2px solid #ff7d74;cursor:pointer}
 .creg.on{box-shadow:0 0 0 2px #fff;z-index:1}
-.creg i{position:absolute;top:0;bottom:0;right:0;background:repeating-linear-gradient(135deg,#34503a 0 5px,#5d7a63 5px 10px)}
+.creg i{position:absolute;top:0;bottom:0;right:0;background:repeating-linear-gradient(135deg,#1f4a3a 0 5px,#3f7560 5px 10px)}
 #ccur,#cmark{position:absolute;top:-5px;bottom:-5px;width:2px;margin-left:-1px;pointer-events:none;z-index:2}
 #ccur{background:#fff}
-#cmark{background:#6ea8ff}
+#cmark{background:var(--acc2)}
 #cticks{position:relative;height:18px;margin-top:3px;font-size:11px;color:var(--dim)}
 #cticks span{position:absolute;transform:translateX(-50%);white-space:nowrap}
 #crow{display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;margin-top:4px}
 #cinfo{flex:1;min-width:240px}
 #chelp{margin:6px 0 0;font-size:12px}
-#cpop{position:absolute;bottom:calc(100% - 6px);z-index:3;padding:4px;border:1px solid #5a5a5a;border-radius:6px;background:#111;box-shadow:0 8px 24px #000a;pointer-events:none}
+#cpop{position:absolute;bottom:calc(100% - 6px);z-index:3;padding:4px;border:1px solid var(--line2);border-radius:8px;background:#0c0d11;box-shadow:0 8px 24px #000a;pointer-events:none}
 #ctile{position:relative;width:320px;background:#000 no-repeat}
 #cimg{position:absolute;left:4px;top:4px;width:320px;visibility:hidden}
 #cimg.on{visibility:visible}
 #ctime{display:block;padding-top:3px;text-align:center;font-size:12px;font-variant-numeric:tabular-nums}
 #v.cutting #prev,#v.cutting #next,#v.cutting #pdir,#v.cutting #ndir,#v.cutting #vdel,#v.cutting #vcut{pointer-events:none;opacity:.4}
-#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:20;max-width:90vw;padding:8px 14px;border-radius:6px;background:#202020;border:1px solid #5a5a5a;opacity:0;pointer-events:none}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:60;max-width:90vw;padding:9px 16px;border-radius:10px;background:#1d2029;border:1px solid var(--line2);box-shadow:0 10px 30px #000a;opacity:0;pointer-events:none}
 body.viewing #toast{bottom:76px}
 #toast.on{opacity:1}
 #toast.bad{border-color:var(--bad)}
 @media (prefers-reduced-motion:no-preference){#toast{transition:opacity .2s}}
 @media (max-width:760px){
   #wrap{flex-direction:column;align-items:stretch}
-  #tree{position:static;max-height:240px;flex-basis:auto;border-right:0;border-bottom:1px solid var(--line)}
+  #tree{position:static;max-height:240px;min-height:0;flex-basis:auto;border-right:0;border-bottom:1px solid var(--line)}
 }
 
 [hidden]{display:none !important}
-#tabs{display:flex}
-.tab{background:#333;border:1px solid #5a5a5a;border-radius:0;padding:5px 14px}
-.tab:first-child{border-radius:5px 0 0 5px}
-.tab:last-child{border-radius:0 5px 5px 0;border-left:0}
-.tab.on{background:#4d4d4d;border-color:#808080;font-weight:600}
-.tab .n{margin-left:6px;color:var(--dim);font-weight:400}
-button.go{background:#e8e8e8;border-color:#e8e8e8;color:#1c1c1c;font-weight:600}
-button.go:hover:not(:disabled){background:#fff}
-button.danger{border-color:var(--bad);color:#f3c1bd}
-button.danger:hover:not(:disabled){background:#4a2a28}
+#tabs{display:flex;padding:3px;gap:2px;background:#0d0e12;border:1px solid var(--line);border-radius:10px}
+.tab{background:none;border:0;border-radius:7px;padding:4px 12px;color:var(--dim)}
+.tab:hover:not(:disabled){background:#1f222b;color:var(--text)}
+.tab.on,.tab.on:hover:not(:disabled){background:var(--ctlh);color:var(--text);font-weight:600;box-shadow:0 1px 3px #0008}
+.tab .n{margin-left:6px;color:var(--dim);font-weight:400;font-variant-numeric:tabular-nums}
+button.go{background:var(--accg);border-color:transparent;color:#fff;font-weight:600}
+button.go:hover:not(:disabled){background:var(--accg);border-color:transparent;filter:brightness(1.12)}
+button.danger{border-color:#6a3034;color:#ffb4ae;background:#2a1b1e}
+button.danger:hover:not(:disabled){background:#3d2226;border-color:var(--bad)}
 body.mode-v .op{display:none !important}
-input[type=checkbox]{accent-color:#e8e8e8}
+input[type=checkbox]{accent-color:var(--acc)}
 body.mode-v #grid,body.mode-v #empty{display:none}
-#vl{display:none;padding:0 16px 28px}
+#vl{display:none;padding:0 18px 28px}
 body.mode-v #vl{display:block}
 #vtool{position:sticky;top:var(--hh);z-index:4;display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;padding:12px 0;background:var(--bg);border-bottom:1px solid var(--line)}
 #vsel{margin-right:auto;font-weight:600}
 #vign,#vfmt{margin:10px 0 0;font-size:12px}
-#fact{display:flex;flex-direction:column;gap:6px;margin:0 0 12px;padding:0 4px}
+#fact{display:flex;flex-direction:column;gap:6px;margin:0 0 10px;padding:0 4px}
 #fact button{width:100%;text-align:left}
-#dlg{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;background:#000a}
-#dlg .box{width:min(540px,calc(100vw - 32px));padding:18px;border:1px solid #5a5a5a;border-radius:10px;background:#252525;box-shadow:0 12px 40px #000a}
-#dtxt{margin:0 0 16px;line-height:1.55;white-space:pre-line;max-height:60vh;overflow:auto}
-#dlg .acts{display:flex;justify-content:flex-end;gap:8px}
-.pk{position:absolute;left:8px;top:8px;z-index:2;width:24px;height:24px;border:2px solid #e8e8e8;border-radius:6px;background:#000a;opacity:0;cursor:pointer}
+#dlg,#ov{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;background:#05060acc;backdrop-filter:blur(3px)}
+#dlg .box,.sheet{width:min(540px,calc(100vw - 32px));padding:20px;border:1px solid var(--line2);border-radius:14px;background:#1a1c23;box-shadow:0 20px 60px #000c}
+#dtxt{margin:0 0 18px;line-height:1.55;white-space:pre-line;max-height:60vh;overflow:auto}
+#dlg .acts,.sheet .acts{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px}
+.pk{position:absolute;left:8px;top:8px;z-index:2;width:24px;height:24px;border:2px solid #e8e8f0;border-radius:7px;background:#000a;opacity:0;cursor:pointer}
 figure:hover .pk,body.picking .pk{opacity:1}
-figure.pick{box-shadow:0 0 0 3px #6ea8ff}
-figure.pick .pk{opacity:1;border-color:#6ea8ff;background:#6ea8ff}
-figure.pick .pk::after{content:'✓';position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#10243f;font-size:16px;font-weight:700}
-#selbar{flex-basis:100%;display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px}
-#selcnt{margin-right:6px;font-weight:600;color:#9cc4ff}
+figure.pick{border-color:var(--acc2);box-shadow:0 0 0 2px var(--acc2)}
+figure.pick .pk{opacity:1;border-color:var(--acc2);background:var(--acc2)}
+figure.pick .pk::after{content:'✓';position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#062037;font-size:16px;font-weight:700}
+#selbar{flex-basis:100%;display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;padding-top:6px;border-top:1px solid var(--line)}
+#selcnt{margin-right:6px;font-weight:600;color:#8fd0ff}
 #vi{cursor:zoom-out}
 #fact2{display:flex;gap:6px;margin:0 0 12px;padding:0 4px}
-#fact2 button{flex:1;min-width:0}
+#fact2 button{flex:1;min-width:0;padding:5px 8px;white-space:nowrap;font-size:13px}
 #jobbar{flex-basis:100%;margin-top:-2px}
 .jrow{display:flex;align-items:center;gap:12px;color:var(--dim);font-size:13px}
 .jrow span{flex:1;min-width:0}
 .jrow button{padding:2px 10px;font-size:12px}
-#vnote{margin:12px 0 0;padding:10px 12px;border-radius:6px;background:#3a3326;color:#f1ddaa;line-height:1.5}
-code{padding:1px 6px;border-radius:4px;background:#00000040;font-family:Consolas,"Cascadia Mono",monospace;font-size:13px}
+#vnote{margin:12px 0 0;padding:10px 12px;border-radius:10px;background:#2e2818;border:1px solid #4d4224;color:#f1ddaa;line-height:1.5}
+code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas,"Cascadia Mono",monospace;font-size:13px}
 #vprog{margin:12px 0 0;color:var(--dim);font-size:13px}
-.bar{height:6px;margin-bottom:4px;border-radius:3px;background:#444;overflow:hidden}
-.bar i{display:block;width:0;height:100%;background:var(--pick)}
+.bar{height:6px;margin-bottom:4px;border-radius:3px;background:#262a35;overflow:hidden}
+.bar i{display:block;width:0;height:100%;background:var(--accg);transition:width .3s}
 .grp{margin-top:16px}
-.gh{display:flex;align-items:center;gap:10px;padding:7px 8px;border-radius:6px;background:var(--cell);color:var(--text);font-weight:600;cursor:pointer}
+.gh{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:10px;background:var(--cell);border:1px solid var(--line);color:var(--text);font-weight:600;cursor:pointer}
 .gh .gc{font-size:12px;font-weight:400;color:var(--dim)}
 .gh .tag{margin-left:auto;font-size:12px;font-weight:400;color:var(--dim)}
-.vr{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;padding:5px 8px 5px 26px;border-bottom:1px solid #353535}
+.vr{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;padding:5px 8px 5px 26px;border-bottom:1px solid #1f222a}
+.vr:hover{background:#171920}
 .vr label{flex:1;min-width:0;gap:10px;color:var(--text);cursor:pointer}
 .vn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .vs,.vd{font-size:12px;color:var(--dim);white-space:nowrap}
 .vr button{padding:2px 9px;font-size:12px}
-.vr.bad{background:#35201f}
-.verr{flex-basis:100%;padding-left:26px;color:#f3c1bd;font-size:12px}
+.vr.bad{background:var(--badbg)}
+.verr{flex-basis:100%;padding-left:26px;color:#ffc2bd;font-size:12px}
 .pad{padding:20px 8px}
-#trashp,#rootp{position:fixed;right:16px;top:calc(var(--hh) + 6px);z-index:30;width:min(400px,calc(100vw - 32px));padding:14px;border:1px solid #5a5a5a;border-radius:8px;background:#202020;box-shadow:0 8px 28px #0008}
+#trashp,#rootp,#menup{position:fixed;right:14px;top:calc(var(--hh) + 6px);z-index:30;width:min(400px,calc(100vw - 32px));padding:14px;border:1px solid var(--line2);border-radius:12px;background:#1a1c23;box-shadow:0 14px 40px #000b}
 #trashp p,#rootp p{margin:0;line-height:1.5}
 #trashp .acts,#rootp .acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
-#rootp{left:16px;right:auto;width:min(520px,calc(100vw - 32px))}
+#rootp{left:14px;right:auto;width:min(520px,calc(100vw - 32px))}
 #rooti{word-break:break-all}
 #rootl{display:flex;flex-direction:column;gap:4px;margin-top:10px;max-height:50vh;overflow:auto}
-#rootl button{display:flex;flex-direction:column;align-items:flex-start;text-align:left;padding:5px 10px}
+#rootl button{display:flex;flex-direction:column;align-items:flex-start;text-align:left;padding:6px 10px}
 #rootl .dim{font-size:12px;word-break:break-all}
 #rootb{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+#menup{width:280px;padding:6px}
+#menup button{display:flex;align-items:center;gap:10px;width:100%;padding:8px 10px;text-align:left;background:none;border:0;border-radius:7px}
+#menup button:hover{background:var(--ctlh)}
+#menup button svg{width:16px;height:16px;flex:none;color:var(--dim)}
+#menup hr{margin:5px 6px;border:0;border-top:1px solid var(--line)}
+#menup .ver{padding:6px 10px 4px;font-size:12px;color:var(--dim)}
+#mupd .badge{margin-left:auto;padding:1px 8px;border-radius:20px;background:#173c2d;color:var(--ok);font-size:12px;font-weight:600}
+.sheet h2{margin:0 0 8px;font-size:18px}
+.sheet p{margin:0 0 14px;line-height:1.55}
+#donp{width:min(620px,calc(100vw - 32px))}
+.don{display:flex;gap:20px;align-items:stretch;margin-bottom:18px}
+.dl{flex:1;display:flex;flex-direction:column;gap:8px}
+.dl button{display:flex;align-items:center;gap:12px;padding:10px 14px;text-align:left;border-radius:10px}
+.dl button b{display:block}
+.dl button span span{font-size:12px;color:var(--dim)}
+.dl .ic{display:flex;align-items:center;justify-content:center;width:34px;height:34px;flex:none;border-radius:9px;font-weight:700;color:#fff}
+.qr{display:flex;flex-direction:column;align-items:center;gap:6px;font-size:12px;color:var(--dim)}
+.qr svg{width:160px;height:160px;border-radius:10px;display:block}
+@media (max-width:560px){.don{flex-direction:column}}
+#updn{max-height:200px;overflow:auto;margin:0 0 14px;padding:10px 12px;border-radius:8px;background:#121318;font-size:13px;white-space:pre-wrap}
+#keyp{width:min(620px,calc(100vw - 32px))}
+.keys{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;align-items:center;margin:0 0 16px;max-height:62vh;overflow:auto}
+.keys h3{grid-column:1/-1;margin:8px 0 0;font-size:13px;color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em}
+.keys h3:first-child{margin-top:0}
 </style>
 </head>
 <body>
 <header>
+  <span id="logo"><svg viewBox="0 0 64 64" aria-hidden="true"><defs><linearGradient id="lg" x2="0" y2="1"><stop offset="0" stop-color="#7c5cff"/><stop offset="1" stop-color="#1eaaff"/></linearGradient></defs><rect x="3" y="3" width="58" height="58" rx="14" fill="url(#lg)"/><circle cx="32" cy="32" r="19" fill="#fff"/><path d="M26 22v20l16-10z" fill="#5476ff"/></svg>VSPO</span>
   <button id="rootb" title="Open another folder"></button>
   <div id="tabs">
     <button id="tab-p" class="tab on">Previews <span id="np" class="n"></span></button>
@@ -2430,20 +2708,22 @@ code{padding:1px 6px;border-radius:4px;background:#00000040;font-family:Consolas
   </div>
   <span id="cnt"></span>
   <button id="refresh" title="Reread the folder: find new videos and previews, drop missing ones (F5)">Refresh</button>
-  <label class="op">Sort
-    <select id="srt">
-      <option value="name">by name</option>
-      <option value="new">newest first</option>
-      <option value="old">oldest first</option>
-      <option value="big">largest first</option>
+  <label class="op" title="Sort order">
+    <select id="srt" aria-label="Sort order">
+      <option value="name">Sort: by name</option>
+      <option value="new">Sort: newest first</option>
+      <option value="old">Sort: oldest first</option>
+      <option value="big">Sort: largest first</option>
     </select>
   </label>
-  <label class="op">Tile size <input id="sz" type="range" min="200" max="1600" step="20"></label>
-  <button id="und" class="op" disabled>Undo delete</button>
+  <label class="op" title="Tile size"><svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="3" width="8" height="8" rx="2"/><rect x="3" y="13" width="8" height="8" rx="2"/><rect x="13" y="13" width="8" height="8" rx="2"/></svg><input id="sz" type="range" min="200" max="1600" step="20" aria-label="Tile size"></label>
+  <button id="und" class="op" disabled title="Bring back what was deleted last (Ctrl+Z)">Undo</button>
   <button id="trash" hidden title="Files you deleted in the gallery that are still in the _to_delete folder"></button>
   <button id="tg" title="Show or hide the folder tree">Folders</button>
   <button id="redo" class="op" hidden title="Replace the previews in this folder with new ones: grid, size and look come from the launch options. Old previews go to _to_delete"></button>
   <button id="orph" class="op" hidden title="Previews that have no video (marked &quot;no video&quot; on the tile) will be moved to _to_delete. Ctrl+Z brings them back"></button>
+  <button id="donb" class="ib sp" title="Support VSPO"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 21s-7.5-4.6-9.6-9.2C1 8.6 3 5 6.6 5c2.1 0 3.6 1.1 5.4 3 1.8-1.9 3.3-3 5.4-3C21 5 23 8.6 21.6 11.8 19.5 16.4 12 21 12 21z"/></svg>Support</button>
+  <button id="menub" class="ib" title="Menu: updates, keyboard shortcuts, about"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
   <div id="selbar" class="op" hidden>
     <span id="selcnt"></span>
     <button id="sdel" class="danger" title="Move the selected videos with their previews to _to_delete (Del). Ctrl+Z brings them all back"></button>
@@ -2456,16 +2736,6 @@ code{padding:1px 6px;border-radius:4px;background:#00000040;font-family:Consolas
     <div class="bar"><i id="vbar"></i></div>
     <div class="jrow"><span id="vptxt"></span><button id="vstop" hidden>Stop</button></div>
   </div>
-  <span id="keys" class="op">
-    <span><kbd>Arrows</kbd>select</span>
-    <span><kbd>Space</kbd>full screen</span>
-    <span><kbd>Enter</kbd>open video</span>
-    <span><kbd>E</kbd>show in Explorer</span>
-    <span><kbd>Del</kbd>delete video</span>
-    <span><kbd>PgUp PgDn</kbd>folders</span>
-    <span><kbd>X</kbd>select</span>
-    <span><kbd>Ctrl+Z</kbd>undo</span>
-  </span>
 </header>
 <div id="rootp" hidden>
   <p>Current folder: <span id="rooti" class="dim"></span></p>
@@ -2474,6 +2744,14 @@ code{padding:1px 6px;border-radius:4px;background:#00000040;font-family:Consolas
     <button id="rpick" class="go">Choose another folder…</button>
     <button id="rcancel">Cancel</button>
   </div>
+</div>
+<div id="menup" hidden>
+  <button id="mupd"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-5-5m5 5l5-5M4 20h16"/></svg><span id="mupdt">Check for updates</span></button>
+  <button id="mdon"><svg style="color:#ff9db8" viewBox="0 0 24 24" fill="currentColor"><path d="M12 21s-7.5-4.6-9.6-9.2C1 8.6 3 5 6.6 5c2.1 0 3.6 1.1 5.4 3 1.8-1.9 3.3-3 5.4-3C21 5 23 8.6 21.6 11.8 19.5 16.4 12 21 12 21z"/></svg>Support the project</button>
+  <button id="mkeys"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10" stroke-linecap="round"/></svg>Keyboard shortcuts</button>
+  <button id="mgh"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2a10 10 0 00-3.2 19.5c.5.1.7-.2.7-.5v-1.7c-2.8.6-3.4-1.3-3.4-1.3-.5-1.2-1.1-1.5-1.1-1.5-.9-.6.1-.6.1-.6 1 .1 1.5 1 1.5 1 .9 1.5 2.4 1.1 2.9.8.1-.7.4-1.1.6-1.3-2.2-.3-4.6-1.1-4.6-5 0-1.1.4-2 1-2.7-.1-.3-.4-1.3.1-2.7 0 0 .8-.3 2.7 1a9.4 9.4 0 015 0c1.9-1.3 2.7-1 2.7-1 .5 1.4.2 2.4.1 2.7.6.7 1 1.6 1 2.7 0 3.9-2.4 4.7-4.6 5 .4.3.7.9.7 1.9V21c0 .3.2.6.7.5A10 10 0 0012 2z"/></svg>Project page on GitHub</button>
+  <hr>
+  <div id="mver" class="ver"></div>
 </div>
 <div id="trashp" hidden>
   <p id="trashi"></p>
@@ -2556,6 +2834,55 @@ code{padding:1px 6px;border-radius:4px;background:#00000040;font-family:Consolas
   <div class="box">
     <p id="dtxt"></p>
     <div class="acts"><button id="dno">Cancel</button><button id="dok" class="go">Continue</button></div>
+  </div>
+</div>
+<div id="ov" hidden>
+  <div id="donp" class="sheet" hidden>
+    <h2>Support VSPO</h2>
+    <p class="dim">VSPO is free and open source. If it saves you time, you can support its development: every donation helps.</p>
+    <div class="don">
+      <div class="dl">
+        <button data-link="monobank"><span class="ic" style="background:#1d1d1d;border:1px solid #444">m</span><span><b>Monobank</b><span>Card of any bank</span></span></button>
+        <button data-link="kofi"><span class="ic" style="background:#13c3ff">K</span><span><b>Ko-fi</b><span>Card, PayPal</span></span></button>
+        <button data-link="crypto"><span class="ic" style="background:#3f51d8">₿</span><span><b>Crypto</b><span>NOWPayments</span></span></button>
+      </div>
+      <div class="qr"><svg aria-label="QR code: Monobank jar" viewBox="-2 -2 33 33" shape-rendering="crispEdges"><rect x="-2" y="-2" width="33" height="33" fill="#fff"/><path fill="#000" d="M0 0h7v1h-7zM8 0h2v1h-2zM11 0h1v1h-1zM13 0h1v1h-1zM15 0h1v1h-1zM17 0h1v1h-1zM22 0h7v1h-7zM0 1h1v1h-1zM6 1h1v1h-1zM11 1h1v1h-1zM13 1h2v1h-2zM16 1h1v1h-1zM18 1h1v1h-1zM22 1h1v1h-1zM28 1h1v1h-1zM0 2h1v1h-1zM2 2h3v1h-3zM6 2h1v1h-1zM8 2h3v1h-3zM12 2h2v1h-2zM16 2h2v1h-2zM22 2h1v1h-1zM24 2h3v1h-3zM28 2h1v1h-1zM0 3h1v1h-1zM2 3h3v1h-3zM6 3h1v1h-1zM9 3h1v1h-1zM11 3h3v1h-3zM17 3h3v1h-3zM22 3h1v1h-1zM24 3h3v1h-3zM28 3h1v1h-1zM0 4h1v1h-1zM2 4h3v1h-3zM6 4h1v1h-1zM10 4h1v1h-1zM12 4h1v1h-1zM15 4h1v1h-1zM17 4h2v1h-2zM20 4h1v1h-1zM22 4h1v1h-1zM24 4h3v1h-3zM28 4h1v1h-1zM0 5h1v1h-1zM6 5h1v1h-1zM8 5h1v1h-1zM10 5h1v1h-1zM12 5h1v1h-1zM16 5h1v1h-1zM20 5h1v1h-1zM22 5h1v1h-1zM28 5h1v1h-1zM0 6h7v1h-7zM8 6h1v1h-1zM10 6h1v1h-1zM12 6h1v1h-1zM14 6h1v1h-1zM16 6h1v1h-1zM18 6h1v1h-1zM20 6h1v1h-1zM22 6h7v1h-7zM11 7h1v1h-1zM14 7h1v1h-1zM18 7h2v1h-2zM0 8h1v1h-1zM2 8h1v1h-1zM6 8h2v1h-2zM10 8h2v1h-2zM13 8h1v1h-1zM15 8h1v1h-1zM18 8h1v1h-1zM20 8h1v1h-1zM23 8h1v1h-1zM26 8h1v1h-1zM28 8h1v1h-1zM1 9h1v1h-1zM3 9h2v1h-2zM8 9h1v1h-1zM10 9h3v1h-3zM16 9h2v1h-2zM19 9h2v1h-2zM22 9h1v1h-1zM27 9h2v1h-2zM0 10h1v1h-1zM2 10h6v1h-6zM12 10h1v1h-1zM14 10h3v1h-3zM19 10h2v1h-2zM23 10h4v1h-4zM28 10h1v1h-1zM0 11h2v1h-2zM5 11h1v1h-1zM8 11h3v1h-3zM15 11h1v1h-1zM18 11h3v1h-3zM22 11h2v1h-2zM25 11h1v1h-1zM1 12h1v1h-1zM5 12h2v1h-2zM8 12h1v1h-1zM10 12h2v1h-2zM13 12h4v1h-4zM20 12h1v1h-1zM22 12h2v1h-2zM28 12h1v1h-1zM0 13h3v1h-3zM4 13h1v1h-1zM7 13h2v1h-2zM12 13h2v1h-2zM16 13h2v1h-2zM19 13h2v1h-2zM22 13h2v1h-2zM27 13h2v1h-2zM0 14h2v1h-2zM5 14h2v1h-2zM8 14h2v1h-2zM11 14h2v1h-2zM15 14h2v1h-2zM18 14h2v1h-2zM23 14h1v1h-1zM28 14h1v1h-1zM2 15h1v1h-1zM9 15h2v1h-2zM13 15h1v1h-1zM15 15h2v1h-2zM21 15h1v1h-1zM23 15h2v1h-2zM1 16h1v1h-1zM3 16h2v1h-2zM6 16h2v1h-2zM9 16h1v1h-1zM13 16h1v1h-1zM16 16h1v1h-1zM19 16h2v1h-2zM22 16h2v1h-2zM28 16h1v1h-1zM2 17h1v1h-1zM4 17h1v1h-1zM8 17h1v1h-1zM11 17h2v1h-2zM15 17h2v1h-2zM19 17h2v1h-2zM22 17h2v1h-2zM26 17h3v1h-3zM0 18h2v1h-2zM3 18h1v1h-1zM6 18h3v1h-3zM13 18h8v1h-8zM24 18h2v1h-2zM28 18h1v1h-1zM4 19h2v1h-2zM9 19h1v1h-1zM11 19h2v1h-2zM14 19h1v1h-1zM16 19h1v1h-1zM18 19h2v1h-2zM21 19h3v1h-3zM0 20h9v1h-9zM10 20h2v1h-2zM13 20h3v1h-3zM19 20h7v1h-7zM27 20h1v1h-1zM8 21h1v1h-1zM11 21h1v1h-1zM13 21h3v1h-3zM18 21h1v1h-1zM20 21h1v1h-1zM24 21h3v1h-3zM28 21h1v1h-1zM0 22h7v1h-7zM8 22h2v1h-2zM12 22h1v1h-1zM15 22h1v1h-1zM18 22h1v1h-1zM20 22h1v1h-1zM22 22h1v1h-1zM24 22h1v1h-1zM28 22h1v1h-1zM0 23h1v1h-1zM6 23h1v1h-1zM10 23h1v1h-1zM12 23h2v1h-2zM16 23h1v1h-1zM19 23h2v1h-2zM24 23h1v1h-1zM27 23h2v1h-2zM0 24h1v1h-1zM2 24h3v1h-3zM6 24h1v1h-1zM10 24h2v1h-2zM13 24h1v1h-1zM16 24h1v1h-1zM18 24h8v1h-8zM28 24h1v1h-1zM0 25h1v1h-1zM2 25h3v1h-3zM6 25h1v1h-1zM9 25h1v1h-1zM11 25h1v1h-1zM15 25h3v1h-3zM19 25h3v1h-3zM24 25h3v1h-3zM28 25h1v1h-1zM0 26h1v1h-1zM2 26h3v1h-3zM6 26h1v1h-1zM8 26h1v1h-1zM13 26h1v1h-1zM15 26h2v1h-2zM21 26h1v1h-1zM24 26h1v1h-1zM27 26h2v1h-2zM0 27h1v1h-1zM6 27h1v1h-1zM9 27h1v1h-1zM14 27h3v1h-3zM18 27h1v1h-1zM20 27h6v1h-6zM0 28h7v1h-7zM8 28h2v1h-2zM11 28h2v1h-2zM14 28h2v1h-2zM18 28h1v1h-1zM20 28h2v1h-2zM23 28h2v1h-2zM28 28h1v1h-1z"/></svg><span>Monobank jar</span></div>
+    </div>
+    <div class="acts"><button id="drare" hidden>Remind me less often</button><button id="dclose" class="go">Close</button></div>
+  </div>
+  <div id="updp" class="sheet" hidden>
+    <h2 id="updh">Updates</h2>
+    <p id="updt"></p>
+    <div id="updn" hidden></div>
+    <div id="updbar" class="bar" hidden><i id="updi"></i></div>
+    <div class="acts"><button id="updnotes" hidden>Release page</button><button id="updclose">Close</button><button id="updgo" class="go" hidden>Update and restart</button></div>
+  </div>
+  <div id="keyp" class="sheet" hidden>
+    <h2>Keyboard shortcuts</h2>
+    <div class="keys">
+      <h3>Gallery</h3>
+      <span><kbd>←</kbd> <kbd>→</kbd> <kbd>↑</kbd> <kbd>↓</kbd> <kbd>Home</kbd> <kbd>End</kbd></span><span>select a preview</span>
+      <span><kbd>Space</kbd></span><span>full screen view</span>
+      <span><kbd>Enter</kbd></span><span>open the video</span>
+      <span><kbd>E</kbd></span><span>show the file in Explorer</span>
+      <span><kbd>Del</kbd></span><span>delete the video (or all selected)</span>
+      <span><kbd>[</kbd> <kbd>]</kbd> <kbd>PgUp</kbd> <kbd>PgDn</kbd></span><span>previous / next folder</span>
+      <span><kbd>X</kbd> <kbd>Ctrl+A</kbd></span><span>select / select all</span>
+      <span><kbd>Esc</kbd></span><span>clear selection</span>
+      <span><kbd>Ctrl+Z</kbd></span><span>undo the last delete</span>
+      <span><kbd>F5</kbd></span><span>refresh the file list</span>
+      <h3>Full screen view</h3>
+      <span><kbd>←</kbd> <kbd>→</kbd></span><span>previous / next</span>
+      <span><kbd>I</kbd></span><span>hide the bottom bar</span>
+      <span><kbd>C</kbd></span><span>trim the video</span>
+      <span><kbd>Esc</kbd> <kbd>Space</kbd></span><span>close</span>
+      <h3>Trimming</h3>
+      <span><kbd>←</kbd> <kbd>→</kbd></span><span>cursor by 1 s (Shift — 10 s, Ctrl — 1 min)</span>
+      <span><kbd>I</kbd> <kbd>O</kbd></span><span>start / end of a piece to cut</span>
+      <span><kbd>Del</kbd></span><span>keep the selected piece</span>
+      <span><kbd>Esc</kbd></span><span>clear the mark / selection, close</span>
+    </div>
+    <div class="acts"><button id="keyclose" class="go">Close</button></div>
   </div>
 </div>
 <div id="toast"></div>
@@ -2772,7 +3099,7 @@ function stat() {
   if (mode === 'previews') {
     $('#cnt').textContent = items.length + ' ' + plural(items.length, ['preview', 'previews']) + (items.length !== all.length ? ' of ' + all.length : '');
   }
-  $('#und').textContent = 'Undo delete' + (undoN ? ' (' + undoN + ')' : '');
+  $('#und').textContent = 'Undo' + (undoN ? ' (' + undoN + ')' : '');
   $('#und').disabled = !undoN;
   redoStat();
   $('#empty').hidden = items.length > 0;
@@ -3404,8 +3731,12 @@ addEventListener('keydown', e => {
   }
   if (e.target.matches('select,input')) return;
   if (C && viewer) { cutKey(e); return; }
-  if (!$('#trashp').hidden || !$('#rootp').hidden) {
-    if (e.code === 'Escape') { $('#trashp').hidden = $('#rootp').hidden = true; e.preventDefault(); }
+  if (!$('#ov').hidden) {  // открыто окно меню (донаты, обновление, клавиши): Esc закрывает, остальное не трогаем
+    if (e.code === 'Escape') { e.preventDefault(); closeSheet(); }
+    return;
+  }
+  if (!$('#trashp').hidden || !$('#rootp').hidden || !$('#menup').hidden) {
+    if (e.code === 'Escape') { $('#trashp').hidden = $('#rootp').hidden = $('#menup').hidden = true; e.preventDefault(); }
     return;
   }
   if (mode !== 'previews') return;
@@ -3960,6 +4291,109 @@ $('#fempty').onclick = async () => {
   }
 };
 
+/* ───── меню: обновление с GitHub, поддержка проекта, клавиши ───── */
+
+let upd = {};
+let updTimer = 0;
+function sheet(id) {
+  $('#menup').hidden = true;
+  $('#ov').hidden = false;
+  document.querySelectorAll('.sheet').forEach(x => { x.hidden = x.id !== id; });
+  const b = $('#' + id + ' .go:not([hidden])');
+  if (b) b.focus();
+}
+function closeSheet() {
+  if (upd.running) return;   // идёт скачивание: окно не закрываем, иначе не видно, что программа сейчас перезапустится
+  $('#ov').hidden = true;
+}
+$('#ov').onclick = e => { if (e.target.id === 'ov') closeSheet(); };
+$('#menub').onclick = e => {
+  e.stopPropagation();
+  const m = $('#menup');
+  m.hidden = !m.hidden;
+  if (!m.hidden) $('#trashp').hidden = $('#rootp').hidden = true;
+};
+document.addEventListener('click', e => {
+  if (!$('#menup').hidden && !e.target.closest('#menup')) $('#menup').hidden = true;
+});
+const link = name => api('/api/link', true, {name}).catch(e => toast('Not opened: ' + e.message, true));
+$('#mgh').onclick = () => { $('#menup').hidden = true; link('github'); };
+$('#mkeys').onclick = () => sheet('keyp');
+$('#keyclose').onclick = closeSheet;
+
+function donate(reminder) {
+  $('#drare').hidden = !reminder;
+  sheet('donp');
+}
+$('#donb').onclick = () => donate(false);
+$('#mdon').onclick = () => donate(false);
+$('#dclose').onclick = closeSheet;
+$('#drare').onclick = () => { api('/api/donate/rare', true).catch(() => {}); closeSheet(); };
+$('#donp .dl').onclick = e => {
+  const b = e.target.closest('button[data-link]');
+  if (b) link(b.dataset.link);
+};
+
+function updStat() {
+  $('#mver').textContent = 'VSPO v' + upd.version;
+  $('#menub').classList.toggle('upd', !!upd.newer);
+  $('#mupdt').innerHTML = upd.newer ? 'Update to ' + esc(upd.latest) + '<span class="badge">new</span>' : 'Check for updates';
+  if ($('#updp').hidden) return;
+  const pct = upd.total ? Math.round(100 * upd.done / upd.total) : 0;
+  $('#updh').textContent = upd.newer ? 'VSPO ' + upd.latest + ' is available' : 'Updates';
+  $('#updt').textContent = upd.running
+    ? (upd.stage === 'downloading' ? 'Downloading… ' + pct + '%' + (upd.total ? ' of ' + fmtSize(upd.total) : '')
+      : upd.stage === 'installing' ? 'Installing…' : 'Restarting VSPO…')
+    : upd.checking ? 'Checking GitHub…'
+    : upd.error ? 'Update failed: ' + upd.error
+    : upd.newer ? 'You have v' + upd.version + '. The new version will be downloaded from GitHub, then VSPO restarts with the same folder.'
+    : upd.latest ? 'You have the latest version, v' + upd.version + '.' : 'You have v' + upd.version + '.';
+  $('#updn').textContent = upd.notes || '';
+  $('#updn').hidden = !upd.newer || !upd.notes || upd.running;
+  $('#updbar').hidden = !upd.running;
+  $('#updi').style.width = (upd.stage === 'downloading' ? pct : 100) + '%';
+  $('#updgo').hidden = !upd.newer || upd.running;
+  $('#updnotes').hidden = !upd.newer || upd.running;
+  $('#updclose').hidden = upd.running;
+}
+async function updTick() {
+  updTimer = 0;
+  try { upd = await api('/api/update'); } catch (_) {
+    if (upd.stage === 'restarting') { $('#updt').textContent = 'VSPO has restarted in a new window. This one can be closed.'; return; }
+  }
+  updStat();
+  if (upd.running || upd.checking) updTimer = setTimeout(updTick, 500);
+}
+$('#mupd').onclick = async () => {
+  sheet('updp');
+  updStat();
+  if (upd.newer) return;
+  upd.checking = true;
+  updStat();
+  try { upd = await api('/api/update/check', true); } catch (e) { upd.checking = false; upd.error = e.message; }
+  updStat();
+};
+$('#updclose').onclick = closeSheet;
+$('#updnotes').onclick = () => link('releases');
+$('#updgo').onclick = async () => {
+  if (job.running) { toast('Previews are being created: wait until it finishes or stop it', true); return; }
+  try {
+    await store.flush();
+    upd = await api('/api/update/start', true);
+  } catch (e) {
+    upd.error = e.message;
+  }
+  updStat();
+  if (upd.running && !updTimer) updTimer = setTimeout(updTick, 500);
+};
+
+api('/api/app').then(r => {
+  upd = r.update;
+  updStat();
+  if (upd.checking) updTimer = setTimeout(updTick, 1500);
+  if (r.donate) donate(true);
+}).catch(() => {});
+
 load().catch(e => toast(e.message, true));
 </script>
 </body>
@@ -4035,6 +4469,7 @@ def main():
     setup_log()
     ap = argparse.ArgumentParser(description=APP + ' (Video Streams Preview Organizer): browse previews, delete videos, '
                                              'create previews, play in MPC.')
+    ap.add_argument('--version', action='version', version='%s %s' % (APP, VERSION))
     ap.add_argument('folder', nargs='?',
                     help='folder with videos (and previews, if they are stored together); subfolders are included. '
                          'Without it the folder from the last run opens, otherwise "folder" from pairview.json, '
@@ -4177,6 +4612,7 @@ def main():
     for gid, key in enumerate(sorted(groups)):
         GROUPS[gid] = groups[key]
     IDS['next'] = len(groups)
+    threading.Thread(target=cleanup_old_exe, daemon=True).start()
     refresh_trash_stats()  # счёт файлов в _на_удаление идёт в фоне: по сети он может занять минуты
     try:
         srv = Server(('127.0.0.1', a.port), Handler)

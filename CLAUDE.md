@@ -41,6 +41,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | страница | `PAGE = r"""..."""` — весь интерфейс |
 | обрезка видео | `CUT`, `AFTER`, `ff_call()`, `cut_info()`, `key_before()`, `cut_frame()`, `cut_regions()`/`cut_plan()`, `cut_start()`/`cut_worker()`/`cut_stop()` |
 | смена открытой папки | `WIN`, `ask_folder()`, `switch_root()`, `choose_root()` |
+| обновление с GitHub и поддержка проекта | `VERSION`, `REPO`, `LINKS`, `UPD`, `check_update()`, `update_start()`/`update_worker()`, `restart()`, `cleanup_old_exe()`, `donate_due()`, `open_link()` |
 | запуск | `main()`, `load_config()`, `setup_log()`, `die()`, `pick_folder()` |
 
 ## Модель данных
@@ -110,6 +111,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   запись в `UNDO` → пересоздание превью через обычную очередь (`start_job`). Сбой/остановка до замены — оригинал не тронут, `.part` удаляется.
 - `ff_call()` — свой запуск ffprobe/ffmpeg для обрезки: `run()` нельзя, он отказывает после остановки очереди превью (`STOP` остаётся взведённым).
 
+## Обновление с GitHub и донаты
+
+- `VERSION` — версия программы; тег релиза должен быть `v` + `VERSION` (сборка релиза это проверяет и падает при расхождении). Перед новым релизом поднять `VERSION`.
+- Проверка: `check_update()` — `api.github.com/repos/<REPO>/releases/latest` (urllib, без ключа), один раз за запуск в фоне (по первому `GET /api/app`)
+  и по кнопке в меню. Есть новее — зелёная точка на кнопке меню (☰) и пункт «Update to vX.Y».
+- Установка (`update_worker`): exe — скачать `VSPO.exe` из релиза (проверка размера, `MZ`, sha256 из поля `digest`, если GitHub его дал) →
+  запущенный exe переименовать в `VSPO.exe.old` (перезаписать его в Windows нельзя, переименовать можно) → новый на его место.
+  Из исходников — скачать `pairview.py` с тега (проверка `compile`) и `os.replace`. Потом `restart()`: тот же набор параметров,
+  у onefile-exe — `PYINSTALLER_RESET_ENVIRONMENT=1` и без `_MEI*`/`_PYI*` в окружении; затем `os._exit(0)`.
+  `VSPO.exe.old` удаляет следующий запуск (`cleanup_old_exe`). Нельзя во время создания превью и обрезки.
+- Внешние ссылки — только по имени из `LINKS` (`POST /api/link {name}`), открываются браузером по умолчанию: в окне pywebview `<a target=_blank>` ненадёжен.
+- Донаты: кнопка «Support» в шапке и пункт меню → окно с Monobank, Ko-fi, NOWPayments и QR (SVG банки Monobank, встроен в `PAGE`).
+  Напоминание при запуске: раз в неделю, после «Remind me less often» — раз в месяц (`DONATE_DAYS`); о частоте в интерфейсе не писать.
+  Первый запуск только назначает срок. Состояние — `donate: {next, rare}` в settings.json (общее, не по папке). На GitHub — `.github/FUNDING.yml`.
+
 ## Окно и интерфейс
 
 - `main()` поднимает сервер в потоке и вызывает `run_window()` (pywebview, на Windows принудительно `gui='edgechromium'`: IE-движок страницу не потянет).
@@ -121,6 +137,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Автопереходы: листание в просмотре за последнее превью папки идёт в первое следующей (`crossFolder`), назад — в последнее предыдущей.
 - Выделение плиток: чекбокс, Ctrl+клик, Shift+клик (диапазон), X, Ctrl+A. Панель действий над выбранными: удалить пары, пересоздать превью, играть в MPC.
 - Свои диалоги `ask()` вместо системного `confirm()` (в окне приложения системные диалоги не гарантированы).
+- Тема только тёмная; цвета — переменные в `:root` (акцент — градиент иконки `#7c5cff → #1e9bff`). Меню (☰) справа в шапке: обновление,
+  поддержка, список горячих клавиш (окно `#keyp`; в шапке подсказок по клавишам больше нет — при новых клавишах дописывать туда), страница на GitHub, версия.
+  Окна меню — `.sheet` внутри `#ov`, `sheet(id)`/`closeSheet()`; Esc закрывает.
 - Открытая папка меняется без перезапуска: кнопка «Папка: имя ▾» в шапке → список недавних (до 10, `recent` в settings.json) или диалог
   (в своём окне — `create_file_dialog` pywebview, в браузере — tkinter). Путь с клиента принимается только из списка недавних, новый — только диалогом
   на стороне сервера. `switch_root()`: нельзя во время создания превью; `UNDO` очищается; номера пар продолжаются (картинки `/p/<id>` кешируются);
@@ -162,6 +181,8 @@ F5/Ctrl+R — обновить список. В просмотре: ←/→ ли
 | POST | `/api/folder/info`, `/api/folder/delete`, `/api/empty`, `/api/empty/delete` | удаление папок |
 | POST | `/api/purge`, `/api/trash/open`, `/api/settings` | очистка корзины, открыть её, сохранить настройки |
 | POST | `/api/root/pick`, `/api/root/recent` | открыть другую папку: диалогом / из недавних (`{folder}`) |
+| GET | `/api/app`, `/api/update` | версия, статус обновления и «пора напомнить о донатах» (один раз, срок сразу переносится); статус обновления |
+| POST | `/api/update/check`, `/api/update/start`, `/api/donate/rare`, `/api/link` | проверить; скачать и перезапуститься; напоминать реже; открыть ссылку из `LINKS` |
 | GET | `/api/cut`, `/api/cut/frame/<id>?at=&w=` | статус обрезки; точный кадр (JPEG) |
 | POST | `/api/cut/info`, `/api/cut/key`, `/api/cut/start`, `/api/cut/stop` | данные для шкалы; ключевой кадр не позже `at`; обрезать (`{id, cuts: [[a, b]…]}`); остановить |
 
@@ -232,7 +253,8 @@ pyinstaller --onefile --noconsole --name VSPO --icon assets/vspo.ico --collect-a
 ## Что не проверено на настоящем Windows
 
 pywebview/WebView2 и полноэкранный режим окна; вывод окна плеера вперёд; поведение `/add` и запуска в MPC владельца; NVDEC (`--gpu on`);
-скорость создания превью с NAS по SMB и работа режима пачек кадров; сборка exe; диалог выбора папки из окна pywebview
+скорость создания превью с NAS по SMB и работа режима пачек кадров; самообновление exe (подмена через `.old` и перезапуск onefile;
+из исходников проверено в Linux);  диалог выбора папки из окна pywebview
 (`create_file_dialog` из потока HTTP; при сбое — tkinter). Смена папки через список недавних проверена через API и в браузере.
 Обрезка проверена на машине владельца с ffmpeg 8.1 на синтетических x264 mp4/mkv (API, покадрово, отмена, остановка; интерфейс — в браузере событиями из JS),
 но не проверена: на настоящих записях стримов и HEVC, по SMB с NAS (скорость `key_before`/кадров), мышью в окне pywebview.
