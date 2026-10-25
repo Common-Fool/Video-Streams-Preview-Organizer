@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-r"""Video Manager (pairview.py) — просмотр превью, выборочное удаление, создание превью, запуск в MPC.
+r"""VSPO — Video Streams Preview Organizer (pairview.py): browse preview sheets, delete videos, create previews, play in MPC.
 
-  python pairview.py ПАПКА                       видео и превью лежат вместе (подпапки тоже)
-  python pairview.py ПАПКА --previews ПАПКА2     превью в отдельной папке (подпапки те же)
-  python pairview.py ПАПКА --clean videos        показать видео, у которых нет превью
-  python pairview.py ПАПКА --clean previews --apply   убрать превью, у которых нет видео
-  python pairview.py ПАПКА --purge               удалить насовсем всё из ПАПКА/_на_удаление
-  python pairview.py ПАПКА --ignore-ext ts,m2ts  не считать видео файлы .ts и .m2ts (по умолчанию игнорируется .ts)
+  python pairview.py FOLDER                       videos and previews stored together (subfolders too)
+  python pairview.py FOLDER --previews FOLDER2    previews in a separate folder (same subfolders)
+  python pairview.py FOLDER --clean videos        list videos that have no preview
+  python pairview.py FOLDER --clean previews --apply   move away previews that have no video
+  python pairview.py FOLDER --purge               permanently delete everything in FOLDER/_to_delete
+  python pairview.py FOLDER --ignore-ext ts,m2ts  do not treat .ts and .m2ts files as videos (.ts is ignored by default)
 
-Пара — файлы с одинаковым именем без расширения в одной подпапке.
-«Удалить» переносит пару в ПАПКА/_на_удаление (мгновенно и обратимо). Кнопка «На удаление» в шапке
-показывает, сколько там лежит, и очищает папку насовсем.
-Вкладка «Видео без превью» создаёт недостающие превью через ffmpeg (нужен ffmpeg в PATH или --ffmpeg).
-Превью по умолчанию: сетка 10×9 кадров, ширина 2560, на каждом кадре только время (--cols --rows --width --header).
-Кнопка «Пересоздать превью» на вкладке «Превью» заменяет старые превью новыми (старые уходят в _на_удаление).
-Кнопка «Убрать превью без видео» переносит такие превью в _на_удаление, «Обновить» (F5) перечитывает папку.
-Видеокарта NVIDIA: --gpu on декодирует видео на ней; auto и off (по умолчанию auto) — процессор: для превью он не медленнее.
-Своё окно: нужен pywebview (pip install pywebview); без него галерея откроется в браузере. --browser — всегда в браузере.
-Запуск с ярлыка без консоли: pythonw.exe pairview.py "D:\Видео" (журнал и настройки — в %APPDATA%\pairview).
-Без папки в командной строке открывается папка прошлого запуска; другую выбирает кнопка с именем папки в шапке.
-ffmpeg.exe и ffprobe.exe можно положить рядом с программой: они находятся без PATH.
-Постоянные параметры можно записать в pairview.json рядом со скриптом: {"folder": "D:\\Видео", "player": "...mpc-hc64.exe"}.
-Папка из pairview.json берётся, только если папки прошлого запуска нет или она недоступна.
-Только стандартная библиотека, Python 3.8+.
+A video and its preview are files with the same name (without extension) in the same subfolder.
+"Delete" moves the video together with its preview to FOLDER/_to_delete (instant and undoable). The "To delete"
+button in the header shows what is there and empties the folder permanently.
+The "Videos without previews" tab creates missing previews with ffmpeg (ffmpeg in PATH or --ffmpeg is needed).
+Default preview: a 10×9 grid of frames, 2560 px wide, a timestamp on every frame (--cols --rows --width --header).
+"Recreate previews" on the "Previews" tab replaces old previews with new ones (the old ones go to _to_delete).
+"Remove previews without video" moves such previews to _to_delete, "Refresh" (F5) rereads the folder.
+NVIDIA GPU: --gpu on decodes video on it; auto and off (default auto) use the CPU: for previews it is not slower.
+App window: needs pywebview (pip install pywebview); without it the gallery opens in the browser. --browser — always the browser.
+Shortcut without a console: pythonw.exe pairview.py "D:\Videos" (log and settings are in %APPDATA%\pairview).
+Without a folder on the command line the folder from the last run opens; the folder button in the header picks another one.
+ffmpeg.exe and ffprobe.exe can be put next to the program: they are found without PATH.
+Persistent options can be written to pairview.json next to the script: {"folder": "D:\\Videos", "player": "...mpc-hc64.exe"}.
+The folder from pairview.json is used only if the folder from the last run is missing or unavailable.
+Standard library only, Python 3.8+.
 """
 import argparse
 import atexit
@@ -52,7 +52,9 @@ IMAGE = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
          '.avif': 'image/avif'}
 IGNORE = {'.ts'}        # расширения видео, файлы с которыми игнорируются (параметр --ignore-ext)
 SCAN = {'ignored': 0}   # сколько файлов пропущено при последнем сканировании
-TRASH = '_на_удаление'
+TRASH = '_to_delete'
+TRASH_NAMES = (TRASH, '_на_удаление')  # второе — прежнее имя корзины: такие папки тоже корзина
+APP = 'VSPO'  # название в окне, в заголовке страницы и у exe (Video Streams Preview Organizer)
 TOKEN = secrets.token_urlsafe(12)
 ROOT_NAME = ''
 PLAYER = {'path': ''}  # путь к MPC-HC/MPC-BE (--player или автопоиск)
@@ -77,12 +79,12 @@ def walk(root):
                 for e in it:
                     if e.is_dir(follow_symlinks=False):
                         # пропускаем корзину, скрытые папки, @eaDir и #recycle
-                        if e.name != TRASH and e.name[0] not in '.@#':
+                        if e.name not in TRASH_NAMES and e.name[0] not in '.@#':
                             stack.append(e.path)
                     elif e.is_file():
                         yield d, e
         except OSError as err:
-            print('Пропущена папка', d, '—', err)
+            print('Skipped folder', d, '—', err)
 
 
 def scan(vroot, proot):
@@ -178,15 +180,15 @@ def explain(e):
     name = os.path.basename(getattr(e, 'path', '') or '')
     winerr = getattr(c, 'winerror', None)
     if winerr == 206 or c.errno == errno.ENAMETOOLONG or (winerr == 3 and len(getattr(e, 'dst', '')) >= 250):
-        return 'слишком длинный путь для Windows: ' + name + '. Сократите имена папок или включите длинные пути'
+        return 'path too long for Windows: ' + name + '. Shorten folder names or enable long paths'
     if isinstance(c, PermissionError):
-        return ('файл занят другой программой (плеер, проводник, антивирус) или защищён от записи: ' + name +
-                '. Закройте её и нажмите Del ещё раз')
+        return ('the file is in use by another program (player, Explorer, antivirus) or write-protected: ' + name +
+                '. Close that program and press Del again')
     if isinstance(c, FileNotFoundError):
-        return 'файл не найден: ' + name + '. Его убрали или переименовали вне галереи — список обновлён'
+        return 'file not found: ' + name + '. It was moved or renamed outside the gallery — the list has been refreshed'
     if c.errno == errno.EXDEV:
-        return 'файл лежит на другом диске, мгновенный перенос невозможен: ' + name
-    return 'ошибка файловой системы (%s): %s' % (getattr(c, 'strerror', None) or c, name)
+        return 'the file is on another drive, an instant move is not possible: ' + name
+    return 'file system error (%s): %s' % (getattr(c, 'strerror', None) or c, name)
 
 
 def trash_dst(path, root):
@@ -210,7 +212,7 @@ def delete_group(gid):
     with LOCK:
         g = GROUPS.get(gid)
     if g is None:
-        raise Gone('пары уже нет — список обновлён')
+        raise Gone('this video is already gone — the list has been refreshed')
     moved = []
     for path, root, *_ in g['v'] + g['p']:  # видео первым: его чаще держит плеер
         dst = ''
@@ -278,12 +280,12 @@ def undo_last():
     """Вернуть последнее действие целиком (одну пару или всю пачку)."""
     with LOCK:
         if not UNDO:
-            raise LookupError('нечего отменять')
+            raise LookupError('nothing to undo')
         batch = UNDO[-1]
     if any(len(rec) > 3 for rec in batch):  # обрезка: пока пересоздаётся превью, файлы пары трогать нельзя
         with JLOCK:
             if JOB['running']:
-                raise Fail('дождитесь, пока закончится создание превью', 409)
+                raise Fail('wait until preview creation finishes', 409)
     first = None
     for rec in batch:
         gid, g, moved = rec[:3]
@@ -517,7 +519,7 @@ def open_file(path, front=False):
 
 def trash_dirs():
     roots = [VROOT] if PROOT == VROOT else [VROOT, PROOT]
-    return [os.path.join(r, TRASH) for r in roots]
+    return [os.path.join(r, n) for r in roots for n in TRASH_NAMES]
 
 
 TSTAT = {'files': 0, 'bytes': 0, 'ready': False, 'gen': 0}  # счётчик папки «на удаление»: хранится в памяти
@@ -593,7 +595,7 @@ def purge():
     failed = []
     for d in trash_dirs():
         # удаляем только папку с точным именем TRASH прямо внутри корня — и не ходим по ссылкам
-        if os.path.basename(d) != TRASH or os.path.islink(d) or not os.path.isdir(d):
+        if os.path.basename(d) not in TRASH_NAMES or os.path.islink(d) or not os.path.isdir(d):
             continue
         for dp, dn, fn in os.walk(d, topdown=False, followlinks=False):
             for f in fn:
@@ -626,7 +628,7 @@ def open_trash():
         if os.path.isdir(d):
             open_file(d, front=True)
             return
-    raise Fail('папка %s пуста или ещё не создана' % TRASH)
+    raise Fail('the %s folder is empty or does not exist yet' % TRASH)
 
 
 def listing():
@@ -724,7 +726,7 @@ def save_settings(new):
         try:
             write_all_settings(d)
         except OSError as e:
-            print('Не удалось сохранить настройки:', e)
+            print('Could not save settings:', e)
 
 
 RECENT_MAX = 10
@@ -763,7 +765,7 @@ def last_root():
     if not isinstance(v, str) or not v:
         return '', ''
     if not os.path.isdir(v) or (p and not os.path.isdir(p)):
-        print('Папка прошлого запуска недоступна: %s' % (v if not os.path.isdir(v) else p))
+        print('The folder from the last run is not available: %s' % (v if not os.path.isdir(v) else p))
         return '', ''
     return v, p
 
@@ -842,10 +844,10 @@ def send_to_mpc(files, add):
     несколькими вызовами: первый (при воспроизведении) без /add, остальные с /add.
     """
     if not PLAYER['path']:
-        raise Fail('MPC не найден. Укажите путь параметром --player "C:\\...\\mpc-hc64.exe" или в файле pairview.json')
+        raise Fail('MPC not found. Set its path with --player "C:\\...\\mpc-hc64.exe" or in pairview.json')
     files = [f for f in files if os.path.isfile(f)]
     if not files:
-        raise Fail('в этой папке нет видео')
+        raise Fail('there are no videos here')
     chunks, cur, size = [], [], 0
     for f in files:
         n = len(f) + 3
@@ -859,7 +861,7 @@ def send_to_mpc(files, add):
         try:
             subprocess.Popen([PLAYER['path']] + (['/add'] if (add or i > 0) else []) + ch)
         except OSError as e:
-            raise Fail('не удалось запустить %s: %s' % (PLAYER['path'], getattr(e, 'strerror', None) or e), 500)
+            raise Fail('could not start %s: %s' % (PLAYER['path'], getattr(e, 'strerror', None) or e), 500)
         if i + 1 < len(chunks):
             time.sleep(1.5)  # дать первому экземпляру подняться, иначе следующий вызов откроет второе окно
     if os.name == 'nt':
@@ -871,10 +873,10 @@ def inside_root(rel):
     """Папка ВНУТРИ выбранной корневой: относительный путь от клиента проверяется, выйти за корень нельзя."""
     parts = [x for x in (rel or '').replace('\\', '/').split('/') if x not in ('', '.')]
     if '..' in parts:
-        raise Fail('недопустимая папка')
+        raise Fail('invalid folder')
     path = os.path.normpath(os.path.join(VROOT, *parts))
     if os.path.commonpath([os.path.normcase(VROOT), os.path.normcase(path)]) != os.path.normcase(VROOT):
-        raise Fail('недопустимая папка')
+        raise Fail('invalid folder')
     return path
 
 
@@ -884,12 +886,12 @@ def show_in_explorer(rel=None, gid=None):
         with LOCK:
             g = GROUPS.get(gid)
         if g is None:
-            raise Gone('пары уже нет — список обновлён')
+            raise Gone('this video is already gone — the list has been refreshed')
         target, select = (g['v'] or g['p'])[0][0], True
     else:
         target, select = inside_root(rel), False
         if not os.path.isdir(target):
-            raise Fail('папки нет на диске: ' + target)
+            raise Fail('folder not found on disk: ' + target)
     hint = os.path.dirname(target) if select else target
     if os.name == 'nt':
         if select:
@@ -931,7 +933,7 @@ def _scan_empty(d, out):
             found = True
             continue
         if is_dir:
-            if e.name == TRASH or e.name[0] in '.@#':
+            if e.name in TRASH_NAMES or e.name[0] in '.@#':
                 continue
             inner = []
             if _scan_empty(e.path, inner):
@@ -1005,7 +1007,7 @@ def folder_info(rel):
     """Что лежит в папке — для окна подтверждения перед удалением."""
     rel = norm_rel(rel)
     if not rel:
-        raise Fail('корневую папку удалить нельзя: выберите подпапку')
+        raise Fail('the root folder cannot be deleted: choose a subfolder')
     inside_root(rel)
     parts = rel.split('/')
     files = size = dirs = 0
@@ -1016,7 +1018,7 @@ def folder_info(rel):
             continue
         found = True
         for dp, dn, fn in os.walk(base):
-            dn[:] = [d for d in dn if d != TRASH and d[0] not in '.@#']  # системные папки в счёт не идут
+            dn[:] = [d for d in dn if d not in TRASH_NAMES and d[0] not in '.@#']  # системные папки в счёт не идут
             dirs += len(dn)
             for f in fn:
                 if f.lower() in JUNK_FILES:
@@ -1027,7 +1029,7 @@ def folder_info(rel):
                 except OSError:
                     pass
     if not found:
-        raise Fail('папки нет на диске: ' + rel)
+        raise Fail('folder not found on disk: ' + rel)
     with LOCK:
         groups = [g for g in GROUPS.values() if g['dir'] == rel or g['dir'].startswith(rel + '/')]
     media = sum(len(g['v']) + len(g['p']) for g in groups)
@@ -1042,15 +1044,15 @@ def delete_folder(rel):
     """Перенести выбранную папку со всем содержимым в _на_удаление. Ctrl+Z вернёт папку и пары в список."""
     rel = norm_rel(rel)
     if not rel:
-        raise Fail('корневую папку удалить нельзя: выберите подпапку')
+        raise Fail('the root folder cannot be deleted: choose a subfolder')
     inside_root(rel)
     with JLOCK:
         running = JOB['running']
     if running:
-        raise Fail('идёт создание превью: остановите его или дождитесь конца, потом удаляйте папки', 409)
+        raise Fail('previews are being created: stop it or wait until it finishes, then delete folders', 409)
     pairs = trash_folder(rel)
     if not pairs:
-        raise Fail('папки нет на диске: ' + rel)
+        raise Fail('folder not found on disk: ' + rel)
     with LOCK:
         gone = [(gid, g) for gid, g in GROUPS.items() if g['dir'] == rel or g['dir'].startswith(rel + '/')]
         for gid, _g in gone:
@@ -1184,19 +1186,19 @@ def ff_info():
 def gpu_info():
     """Одной строкой: чем декодируется видео при создании превью."""
     if GPU['mode'] == 'off':
-        return 'процессор (--gpu off)'
+        return 'CPU (--gpu off)'
     if not GPU['avail']:
-        return 'процессор (видеокарта NVIDIA с CUDA не найдена)'
+        return 'CPU (no NVIDIA GPU with CUDA found)'
     if GPU['mode'] == 'on':
         bad = sorted(k[0] for k, v in GPU['by'].items() if not v)
-        return 'видеокарта NVIDIA (NVDEC)' + (('; для %s отключена после сбоев' % ', '.join(bad)) if bad else '')
-    return ('процессор (видеокарта NVIDIA найдена, но для превью она не ускоряет: время уходит на запуск ffmpeg '
-            'и чтение файла, а не на декодирование; --gpu on включает её)')
+        return 'NVIDIA GPU (NVDEC)' + (('; disabled for %s after failures' % ', '.join(bad)) if bad else '')
+    return ('CPU (an NVIDIA GPU was found, but it does not speed up previews: the time goes into starting ffmpeg '
+            'and reading the file, not into decoding; --gpu on enables it)')
 
 
 def last_line(text):
     lines = [l.strip() for l in (text or '').splitlines() if l.strip()]
-    return (lines[-1] if lines else 'нет подробностей')[:220]
+    return (lines[-1] if lines else 'no details')[:220]
 
 
 def run(cmd, cwd=None, timeout=180, capture=False):
@@ -1214,7 +1216,7 @@ def run(cmd, cwd=None, timeout=180, capture=False):
         except subprocess.TimeoutExpired:
             p.kill()
             p.communicate()
-            raise Fail('ffmpeg завис и был остановлен (дольше %d с)' % timeout)
+            raise Fail('ffmpeg hung and was stopped (over %d s)' % timeout)
     finally:
         with PLOCK:
             PROCS.discard(p)
@@ -1227,16 +1229,16 @@ def probe(video, runner=None):
     rc, out, err = (runner or run)([FF['ffprobe'], '-v', 'error', '-print_format', 'json', '-show_format',
                         '-show_streams', video], capture=True, timeout=90)
     if rc != 0:
-        raise Fail('ffprobe не смог прочитать файл: ' + last_line(err).replace(video + ': ', ''))
+        raise Fail('ffprobe could not read the file: ' + last_line(err).replace(video + ': ', ''))
     try:
         data = json.loads(out)
     except ValueError:
-        raise Fail('ffprobe вернул непонятный ответ')
+        raise Fail('ffprobe returned an unreadable response')
     streams = data.get('streams') or []
     vs = next((s for s in streams if s.get('codec_type') == 'video'
                and not (s.get('disposition') or {}).get('attached_pic')), None)
     if vs is None:
-        raise Fail('в файле нет видеопотока')
+        raise Fail('the file has no video stream')
     au = next((s for s in streams if s.get('codec_type') == 'audio'), None)
     fmt = data.get('format') or {}
     dur = 0.0
@@ -1270,11 +1272,11 @@ def hms(sec):
 
 def human_size(n):
     n = float(n)
-    for unit in ('Б', 'КБ', 'МБ', 'ГБ'):
+    for unit in ('B', 'KB', 'MB', 'GB'):
         if n < 1024:
-            return ('%d %s' % (n, unit)) if unit == 'Б' else ('%.1f %s' % (n, unit)).replace('.', ',')
+            return ('%d %s' % (n, unit)) if unit == 'B' else '%.1f %s' % (n, unit)
         n /= 1024
-    return ('%.1f ТБ' % n).replace('.', ',')
+    return '%.1f TB' % n
 
 
 def preview_path(g):
@@ -1333,7 +1335,7 @@ def extract_batch(video, jr, work, idx, times, tw, text, fs, hw):
     done = [i for i in idx if os.path.exists(os.path.join(work, jr, 'f%02d.png' % i))]
     if len(done) == len(idx):
         return done, ''
-    return done, err or ('ffmpeg завершился с кодом %d' % rc)
+    return done, err or ('ffmpeg exited with code %d' % rc)
 
 
 def make_preview(g, work, jid, redo=False):
@@ -1346,11 +1348,11 @@ def make_preview(g, work, jid, redo=False):
     final = preview_path(g)
     old = list(g['p']) if redo else []
     if not redo and os.path.exists(final):
-        raise Fail('файл превью уже существует: ' + os.path.basename(final))
+        raise Fail('the preview file already exists: ' + os.path.basename(final))
     info = probe(video)
     d = info['duration']
     if d <= 0:
-        raise Fail('не удалось определить длительность видео')
+        raise Fail('could not determine the video duration')
     hw = use_gpu(video, info)
     gkey = (info['vcodec'], info.get('pix', ''))
     cols, rows, fs_h, hh = sheet_grid(info)
@@ -1380,11 +1382,11 @@ def make_preview(g, work, jid, redo=False):
                         FAST['bad'] += 1
                         if FAST['bad'] >= 3 and FAST['on']:
                             FAST['on'] = False
-                            print('Быстрый рендер отключён (%s). Кадры берутся по одному: это медленнее.' % last_line(err))
+                            print('Fast rendering disabled (%s). Frames are taken one by one: this is slower.' % last_line(err))
                     break
             if got and not FAST['said']:
                 FAST['said'] = True
-                print('Рендер превью: кадры берутся пачками, около %d за один запуск ffmpeg.' % per)
+                print('Preview rendering: frames are taken in batches, about %d per ffmpeg run.' % per)
         for i in range(n):  # недостающие кадры (пачка не сработала, перемотка в «дыру» и т. п.) — по одному, как раньше
             if i in got:
                 continue
@@ -1414,11 +1416,11 @@ def make_preview(g, work, jid, redo=False):
                         GPU['fails'][gkey] = GPU['fails'].get(gkey, 0) + 1
                         if GPU['fails'][gkey] >= 3 and GPU['by'].get(gkey):
                             GPU['by'][gkey] = False
-                            print('Декодирование %s/%s: видеокарта отключена после сбоев, дальше процессор' % (gkey[0], gkey[1] or '?'))
+                            print('Decoding %s/%s: GPU disabled after failures, using the CPU from now on' % (gkey[0], gkey[1] or '?'))
                     hw = GPU['by'].get(gkey, False)
         got = sorted(got)
         if len(got) < max(2, n // 3):
-            raise Fail('не удалось извлечь кадры: ' + last_line(last_err))
+            raise Fail('could not extract frames: ' + last_line(last_err))
         for k, i in enumerate(got):
             os.replace(os.path.join(jd, 'f%02d.png' % i), os.path.join(jd, 's%02d.png' % k))
         rows2 = -(-len(got) // cols)
@@ -1433,10 +1435,10 @@ def make_preview(g, work, jid, redo=False):
             except OSError:
                 size = 0
             lines = [name,
-                     'Размер: %s    Длительность: %s' % (human_size(size), hms(d)),
-                     'Видео: %s, %dx%d%s    Аудио: %s' % (info['vcodec'], info['w'], info['h'],
+                     'Size: %s    Duration: %s' % (human_size(size), hms(d)),
+                     'Video: %s, %dx%d%s    Audio: %s' % (info['vcodec'], info['w'], info['h'],
                                                          (', %s fps' % info['fps']) if info['fps'] else '',
-                                                         info['acodec'] or 'нет')]
+                                                         info['acodec'] or 'none')]
             with open(os.path.join(jd, 'hdr.txt'), 'w', encoding='utf-8') as f:
                 f.write('\n'.join(lines))
             vf2 += (',pad=iw:ih+%d:0:%d:color=%s,drawtext=fontfile=font.ttf:textfile=%s/hdr.txt:expansion=none'
@@ -1446,7 +1448,7 @@ def make_preview(g, work, jid, redo=False):
                            '-frames:v', '1', '-q:v', '3', '%s/sheet.jpg' % jr], cwd=work)
         sheet = os.path.join(jd, 'sheet.jpg')
         if rc != 0 or not os.path.exists(sheet) or os.path.getsize(sheet) == 0:
-            raise Fail('не удалось собрать лист: ' + last_line(err))
+            raise Fail('could not assemble the sheet: ' + last_line(err))
         part = final + '.part'
         moved = []
         try:
@@ -1465,7 +1467,7 @@ def make_preview(g, work, jid, redo=False):
                 os.remove(part)
             except OSError:
                 pass
-            raise Fail('не удалось записать превью (%s): %s' % (getattr(e, 'strerror', None) or e, final))
+            raise Fail('could not write the preview (%s): %s' % (getattr(e, 'strerror', None) or e, final))
         return final, moved
     finally:
         shutil.rmtree(jd, ignore_errors=True)
@@ -1511,7 +1513,7 @@ def worker(q, work, redo=False):
             else:
                 JOB['ok'] += 1
             done, total = JOB['done'], JOB['total']
-        print('[%d/%d] %s: %s' % (done, total, 'ОШИБКА' if err else ('пересоздано' if redo else 'создано'), err or name))
+        print('[%d/%d] %s: %s' % (done, total, 'ERROR' if err else ('recreated' if redo else 'created'), err or name))
 
 
 def finish(threads, work):
@@ -1523,24 +1525,24 @@ def finish(threads, work):
         JOB['running'] = False
         JOB['stopped'] = STOP.is_set()
         ok, failed = JOB['ok'], len(JOB['failed'])
-    print('Создание превью %s: создано %d, ошибок %d' % ('остановлено' if STOP.is_set() else 'завершено', ok, failed))
+    print('Preview creation %s: created %d, errors %d' % ('stopped' if STOP.is_set() else 'finished', ok, failed))
 
 
 def start_job(ids, redo=False):
     if not FF['ok']:
-        raise Fail('ffmpeg не найден: создавать превью нечем. Установите ffmpeg или укажите --ffmpeg ПУТЬ')
+        raise Fail('ffmpeg not found: previews cannot be created. Install ffmpeg or pass --ffmpeg PATH')
     with LOCK:
         todo = [i for i in dict.fromkeys(ids)
                 if isinstance(i, int) and i in GROUPS and GROUPS[i]['v'] and (redo or not GROUPS[i]['p'])]
     if not todo:
-        raise Fail('нечего пересоздавать: у выбранных превью нет видео' if redo
-                   else 'нечего создавать: у выбранных видео уже есть превью')
+        raise Fail('nothing to recreate: the selected previews have no video' if redo
+                   else 'nothing to create: the selected videos already have previews')
     with JLOCK:
         if JOB['running']:
-            raise Fail('создание превью уже идёт', 409)
+            raise Fail('preview creation is already running', 409)
         with CLOCK:
             if CUT['running']:
-                raise Fail('идёт обрезка видео: дождитесь её конца', 409)
+                raise Fail('a video is being trimmed: wait until it finishes', 409)
         JOB.update(running=True, stopped=False, redo=bool(redo), total=len(todo), done=0, ok=0,
                    failed={}, active={}, started=time.time())
     STOP.clear()
@@ -1552,7 +1554,7 @@ def start_job(ids, redo=False):
     except OSError as e:
         with JLOCK:
             JOB['running'] = False
-        raise Fail('не удалось подготовить временную папку: %s' % e)
+        raise Fail('could not prepare a temporary folder: %s' % e)
     q = queue.Queue()
     for i in todo:
         q.put(i)
@@ -1561,7 +1563,7 @@ def start_job(ids, redo=False):
     for t in threads:
         t.start()
     threading.Thread(target=finish, args=(threads, work), daemon=True).start()
-    print('%s превью: %d видео, потоков: %d' % ('Пересоздание' if redo else 'Создание', len(todo), len(threads)))
+    print('%s previews: %d videos, threads: %d' % ('Recreating' if redo else 'Creating', len(todo), len(threads)))
 
 
 def stop_job():
@@ -1609,9 +1611,9 @@ def ff_call(cmd, capture=True, timeout=60, raw=False):
         p = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            timeout=timeout, **POPEN_EXTRA)
     except subprocess.TimeoutExpired:
-        raise Fail('ffmpeg не ответил за %d с' % timeout, 500)
+        raise Fail('ffmpeg did not respond within %d s' % timeout, 500)
     except OSError as e:
-        raise Fail('ffmpeg не запустился: %s' % e, 500)
+        raise Fail('ffmpeg did not start: %s' % e, 500)
     out = p.stdout if raw else p.stdout.decode('utf-8', 'replace')
     return p.returncode, out, p.stderr.decode('utf-8', 'replace')
 
@@ -1620,13 +1622,13 @@ def cut_target(gid):
     with LOCK:
         g = GROUPS.get(gid)
     if g is None:
-        raise Gone('пары уже нет — список обновлён')
+        raise Gone('this video is already gone — the list has been refreshed')
     if not g['v']:
-        raise Fail('у этого превью нет видео')
+        raise Fail('this preview has no video')
     if len(g['v']) > 1:
-        raise Fail('у пары несколько видеофайлов с одним именем: непонятно, какой обрезать')
+        raise Fail('several video files share this name: unclear which one to trim')
     if not FF['ok']:
-        raise Fail('ffmpeg не найден: обрезать нечем. Установите ffmpeg или укажите --ffmpeg ПУТЬ')
+        raise Fail('ffmpeg not found: cannot trim. Install ffmpeg or pass --ffmpeg PATH')
     return g, g['v'][0][0]
 
 
@@ -1634,13 +1636,13 @@ def cut_probe(video):
     try:
         st = os.stat(video)
     except OSError as e:
-        raise Fail('видео недоступно: %s' % (getattr(e, 'strerror', None) or e), 404)
+        raise Fail('video not available: %s' % (getattr(e, 'strerror', None) or e), 404)
     key = (video, st.st_size, st.st_mtime)
     info = PROBES.get(key)
     if info is None:
         info = probe(video, ff_call)
         if info['duration'] <= 0:
-            raise Fail('не удалось определить длительность видео')
+            raise Fail('could not determine the video duration')
         if len(PROBES) > 50:
             PROBES.clear()
         PROBES[key] = info
@@ -1651,7 +1653,7 @@ def cut_info(gid):
     """Данные для таймлайна: длительность и сетка листа превью (по ней страница показывает кадр мгновенно)."""
     g, video = cut_target(gid)
     if os.path.splitext(video)[1].lower() not in MUXERS:
-        raise Fail('файлы %s обрезать не умею' % os.path.splitext(video)[1])
+        raise Fail('cannot trim %s files' % os.path.splitext(video)[1])
     info = cut_probe(video)
     cols, rows, _fs, hh = sheet_grid(info)
     return {'id': gid, 'duration': info['duration'], 'w': info['w'], 'h': info['h'],
@@ -1669,7 +1671,7 @@ def key_before(video, info, t):
                                 '-read_intervals', '%.3f%%%.3f' % (st + a, st + t + 0.5),
                                 '-show_entries', 'packet=pts_time,flags', '-of', 'compact=p=0', video], timeout=90)
         if rc != 0:
-            raise Fail('ffprobe не прочитал файл: ' + last_line(err), 500)
+            raise Fail('ffprobe could not read the file: ' + last_line(err), 500)
         best = None
         for line in out.splitlines():
             f = dict(x.split('=', 1) for x in line.strip().split('|') if '=' in x)
@@ -1703,24 +1705,24 @@ def cut_frame(gid, t, width):
                             '-vf', 'scale=%d:-2' % width, '-f', 'image2pipe', '-c:v', 'mjpeg', '-q:v', '4', 'pipe:1'],
                            timeout=60, raw=True)
     if rc != 0 or not out:
-        raise Fail('кадр не получен: ' + last_line(err), 500)
+        raise Fail('frame not received: ' + last_line(err), 500)
     return out
 
 
 def cut_regions(info, cuts):
     """Проверить и упорядочить вырезаемые куски [(начало, конец)]."""
     if not isinstance(cuts, list):
-        raise Fail('не удалось разобрать запрос')
+        raise Fail('could not parse the request')
     d = info['duration']
     regs = []
     for c in cuts:
         if not (isinstance(c, list) and len(c) == 2 and all(isinstance(x, (int, float)) for x in c)):
-            raise Fail('не удалось разобрать запрос')
+            raise Fail('could not parse the request')
         a, b = max(0.0, min(c)), min(d, max(c))
         if b - a >= 0.05:
             regs.append([a, b])
     if not regs:
-        raise Fail('не отмечено, что вырезать')
+        raise Fail('nothing is marked for removal')
     regs.sort()
     return regs
 
@@ -1744,9 +1746,9 @@ def cut_plan(video, info, regs):
             plan.append([a, b])
     total = sum(b - a for a, b in plan)
     if total < 1:
-        raise Fail('от видео ничего не останется')
+        raise Fail('nothing would be left of the video')
     if d - total < 0.5:
-        raise Fail('вырезать нечего: куски короче расстояния между ключевыми кадрами')
+        raise Fail('nothing to cut: the pieces are shorter than the keyframe interval')
     return plan, total
 
 
@@ -1759,17 +1761,17 @@ def cut_start(gid, cuts):
     g, video = cut_target(gid)
     fmt = MUXERS.get(os.path.splitext(video)[1].lower())
     if not fmt:
-        raise Fail('файлы %s обрезать не умею' % os.path.splitext(video)[1])
+        raise Fail('cannot trim %s files' % os.path.splitext(video)[1])
     regs = cut_regions(cut_probe(video), cuts)
     if regs[0][0] <= 0.05 and regs[-1][1] >= cut_probe(video)['duration'] - 0.05 and len(regs) == 1:
-        raise Fail('от видео ничего не останется')
+        raise Fail('nothing would be left of the video')
     with JLOCK:
         if JOB['running']:
-            raise Fail('идёт создание превью: обрезать можно после него', 409)
+            raise Fail('previews are being created: trim after it finishes', 409)
         with CLOCK:
             if CUT['running']:
-                raise Fail('уже идёт обрезка другого видео', 409)
-            CUT.update(running=True, id=gid, name=os.path.basename(video), stage='подготовка', pct=0,
+                raise Fail('another video is already being trimmed', 409)
+            CUT.update(running=True, id=gid, name=os.path.basename(video), stage='preparing', pct=0,
                        error='', note='', stopped=False)
     threading.Thread(target=cut_worker, args=(gid, g, video, fmt, regs), daemon=True).start()
     return cut_status()
@@ -1822,7 +1824,7 @@ def cut_worker(gid, g, video, fmt, regs):
     try:
         info = cut_probe(video)
         with CLOCK:
-            CUT['stage'] = 'поиск ключевых кадров'
+            CUT['stage'] = 'finding keyframes'
         plan, total = cut_plan(video, info, regs)
         st, d = info['start'], info['duration']
         lines = ['ffconcat version 1.0']
@@ -1839,24 +1841,24 @@ def cut_worker(gid, g, video, fmt, regs):
         with open(lst, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines) + '\n')
         with CLOCK:
-            CUT['stage'] = 'обрезка'
+            CUT['stage'] = 'cutting'
         cmd = [FF['ffmpeg'], '-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-f', 'concat', '-safe', '0',
                '-i', lst, '-map', '0:v:0', '-map', '0:a?', '-c', 'copy', '-avoid_negative_ts', 'make_zero',
                '-progress', 'pipe:1', '-nostats', '-f', fmt, part]
-        print('Обрезка %s: оставляю %s' % (os.path.basename(video), ', '.join('%s–%s' % (hms(a), hms(b)) for a, b in plan)))
+        print('Trimming %s: keeping %s' % (os.path.basename(video), ', '.join('%s–%s' % (hms(a), hms(b)) for a, b in plan)))
         rc, ferr = cut_run(cmd, total, os.path.join(work, 'err.txt'))
         if cut_status()['stopped']:
-            raise Fail('обрезка остановлена, видео не изменено')
+            raise Fail('trimming stopped, the video is unchanged')
         if rc != 0 or not os.path.exists(part) or os.path.getsize(part) == 0:
-            raise Fail('ffmpeg не смог обрезать: ' + last_line(ferr))
+            raise Fail('ffmpeg could not trim: ' + last_line(ferr))
         new = probe(part, ff_call)
         if abs(new['duration'] - total) > max(3.0, total * 0.02):
-            raise Fail('у результата длительность %s вместо %s — видео не изменено' % (hms(new['duration']), hms(total)))
+            raise Fail('the result is %s long instead of %s — the video is unchanged' % (hms(new['duration']), hms(total)))
         with CLOCK:
-            CUT.update(stage='замена файла', pct=100)
+            CUT.update(stage='replacing the file', pct=100)
         with LOCK:
             if GROUPS.get(gid) is not g or not g['v'] or g['v'][0][0] != video:
-                raise Fail('пару удалили или переименовали, пока шла обрезка — видео не изменено')
+                raise Fail('the video was deleted or renamed during trimming — it is unchanged')
             snap = dict(g, v=list(g['v']), p=list(g['p']))  # прежнее состояние пары — для Ctrl+Z
         root, old_size = g['v'][0][1], g['v'][0][2]
         try:
@@ -1870,7 +1872,7 @@ def cut_worker(gid, g, video, fmt, regs):
                 move(trash_v, video)
             except OSError:
                 pass
-            raise Fail('не удалось записать обрезанное видео: %s' % (getattr(e, 'strerror', None) or e))
+            raise Fail('could not write the trimmed video: %s' % (getattr(e, 'strerror', None) or e))
         tstat_add(1, old_size)
         PROBES.clear()
         s2 = os.stat(video)
@@ -1878,7 +1880,7 @@ def cut_worker(gid, g, video, fmt, regs):
         with LOCK:
             g['v'][:] = [(video, root, s2.st_size, s2.st_mtime)]
             UNDO.append([rec])
-        print('Обрезано: %s, было %s, стало %s' % (os.path.basename(video), hms(d), hms(new['duration'])))
+        print('Trimmed: %s, was %s, now %s' % (os.path.basename(video), hms(d), hms(new['duration'])))
     except Fail as e:
         err = str(e)
     except Exception as e:  # noqa: BLE001
@@ -1892,9 +1894,9 @@ def cut_worker(gid, g, video, fmt, regs):
         shutil.rmtree(work, ignore_errors=True)
         WORKDIRS.discard(work)
         with CLOCK:
-            CUT.update(running=False, error=err, stage='' if err else 'готово')
+            CUT.update(running=False, error=err, stage='' if err else 'done')
     if err:
-        print('Обрезка %s: %s' % (os.path.basename(video), err))
+        print('Trimming %s: %s' % (os.path.basename(video), err))
         return
 
     def after(out, moved):  # старое превью ушло в корзину, новое встало: отмена должна вернуть старое
@@ -1907,7 +1909,7 @@ def cut_worker(gid, g, video, fmt, regs):
     except Fail as e:
         AFTER.pop(gid, None)
         with CLOCK:
-            CUT['note'] = 'превью не пересоздано (%s): сделайте это кнопкой «Пересоздать превью»' % e
+            CUT['note'] = 'the preview was not recreated (%s): use the "Recreate previews" button' % e
 
 
 # ───────────────────────── смена открытой папки ─────────────────────────
@@ -1930,7 +1932,7 @@ def ask_folder(initial=''):
                 r = r[0] if r else ''
             return r or ''
         except Exception as e:  # noqa: BLE001 — не вышло диалогом окна: пробуем tkinter
-            print('Диалог окна не открылся (%s: %s), открываю обычный.' % (type(e).__name__, e))
+            print('The window dialog did not open (%s: %s), using the standard one.' % (type(e).__name__, e))
     return pick_folder(initial)
 
 
@@ -1945,21 +1947,21 @@ def switch_root(folder, previews=''):
     proot = os.path.abspath(previews) if previews else vroot
     for r in (vroot, proot):
         if not os.path.isdir(r):
-            raise Fail('папка недоступна: %s' % r, 404)
-    busy = 'идёт создание превью: дождитесь конца или остановите его'
+            raise Fail('folder not available: %s' % r, 404)
+    busy = 'previews are being created: wait until it finishes or stop it'
     with ROOTLOCK:
         with JLOCK:
             if JOB['running']:
                 raise Fail(busy, 409)
         with CLOCK:
             if CUT['running']:
-                raise Fail('идёт обрезка видео: дождитесь её конца', 409)
+                raise Fail('a video is being trimmed: wait until it finishes', 409)
         ignored = SCAN['ignored']
         groups = scan(vroot, proot)
         if not groups:
             n, SCAN['ignored'] = SCAN['ignored'], ignored
-            raise Fail('в папке %s нет ни видео, ни превью' % vroot +
-                       (' (видеофайлы %d шт. игнорируются: --ignore-ext)' % n if n else ''), 404)
+            raise Fail('no videos or previews in %s' % vroot +
+                       (' (%d video files are ignored: --ignore-ext)' % n if n else ''), 404)
         with LOCK, JLOCK:
             if JOB['running']:
                 raise Fail(busy, 409)
@@ -1975,10 +1977,10 @@ def switch_root(folder, previews=''):
     w = WIN['window']
     if w is not None:
         try:
-            w.set_title('Video Manager — ' + ROOT_NAME)
+            w.set_title(APP + ' — ' + ROOT_NAME)
         except Exception:  # noqa: BLE001
             pass
-    print('Открыта папка: %s%s, пар: %d' % (vroot, '' if proot == vroot else ' (превью: %s)' % proot, len(groups)))
+    print('Opened folder: %s%s, items: %d' % (vroot, '' if proot == vroot else ' (previews: %s)' % proot, len(groups)))
     return {'ok': True, 'root': ROOT_NAME}
 
 
@@ -1987,10 +1989,10 @@ def choose_root(folder=None):
     if folder is not None:
         previews = recent_previews(folder)
         if previews is None:
-            raise Fail('этой папки нет в списке недавних')
+            raise Fail('this folder is not in the recent list')
         return switch_root(folder, previews)
     if not PICKLOCK.acquire(blocking=False):
-        raise Fail('окно выбора папки уже открыто', 409)
+        raise Fail('the folder picker is already open', 409)
     try:
         path = ask_folder(VROOT)
     finally:
@@ -2027,7 +2029,7 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             g = GROUPS.get(gid)
         if not g or not g['p']:
-            raise LookupError('нет превью')
+            raise LookupError('no preview')
         path = g['p'][0][0]
         with open(path, 'rb') as f:  # читаем целиком и сразу закрываем: на время отправки файл не держится
             data = f.read()
@@ -2043,9 +2045,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             v = json.loads(raw.decode('utf-8') or '{}')
         except ValueError:
-            raise Fail('не удалось разобрать запрос')
+            raise Fail('could not parse the request')
         if not isinstance(v, dict):
-            raise Fail('не удалось разобрать запрос')
+            raise Fail('could not parse the request')
         return v
 
     def do_GET(self):
@@ -2063,14 +2065,14 @@ class Handler(BaseHTTPRequestHandler):
                 n = 0
             if n > MAX_BODY:
                 self.close_connection = True
-                return self.reply(413, {'error': 'слишком большой запрос'})
+                return self.reply(413, {'error': 'request too large'})
             raw = self.rfile.read(n) if n > 0 else b''
         u = urlparse(self.path)
         t = parse_qs(u.query).get('t', [''])[0]
         host = self.headers.get('Host', '').rsplit(':', 1)[0]
         # запросы принимаются только с ключом из адреса и только на локальный адрес
         if host not in ('127.0.0.1', 'localhost') or not secrets.compare_digest(t.encode(), TOKEN.encode()):
-            return self.reply(403, {'error': 'нет доступа'})
+            return self.reply(403, {'error': 'access denied'})
         p = u.path.strip('/').split('/')
         try:
             if not post and p == ['']:
@@ -2095,9 +2097,9 @@ class Handler(BaseHTTPRequestHandler):
                     body = json.loads(raw.decode('utf-8') or '{}') or {}
                     ids, redo = body.get('ids') or [], bool(body.get('redo'))
                 except (ValueError, AttributeError):
-                    raise Fail('не удалось разобрать запрос')
+                    raise Fail('could not parse the request')
                 if not isinstance(ids, list):
-                    raise Fail('не удалось разобрать запрос')
+                    raise Fail('could not parse the request')
                 start_job(ids, redo)
                 self.reply(200, job_status())
             elif post and p == ['api', 'settings']:
@@ -2113,7 +2115,7 @@ class Handler(BaseHTTPRequestHandler):
             elif post and p == ['api', 'delete-many']:
                 ids = self.jbody(raw).get('ids')
                 if not isinstance(ids, list):
-                    raise Fail('не удалось разобрать запрос')
+                    raise Fail('could not parse the request')
                 self.reply(200, delete_batch(ids))
             elif post and p == ['api', 'explorer']:
                 b = self.jbody(raw)
@@ -2128,7 +2130,7 @@ class Handler(BaseHTTPRequestHandler):
             elif post and p == ['api', 'empty', 'delete']:
                 dirs = self.jbody(raw).get('dirs')
                 if not isinstance(dirs, list):
-                    raise Fail('не удалось разобрать запрос')
+                    raise Fail('could not parse the request')
                 self.reply(200, delete_empty(dirs))
             elif post and p == ['api', 'cut', 'info']:
                 self.reply(200, cut_info(int(self.jbody(raw).get('id', -1))))
@@ -2150,9 +2152,9 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     ids = (json.loads(raw.decode('utf-8') or '{}') or {}).get('ids') or []
                 except (ValueError, AttributeError):
-                    raise Fail('не удалось разобрать запрос')
+                    raise Fail('could not parse the request')
                 if not isinstance(ids, list):
-                    raise Fail('не удалось разобрать запрос')
+                    raise Fail('could not parse the request')
                 self.reply(200, delete_orphans(ids))
             elif post and p == ['api', 'make', 'stop']:
                 stop_job()
@@ -2169,17 +2171,17 @@ class Handler(BaseHTTPRequestHandler):
                 with LOCK:
                     g = GROUPS.get(gid)
                 if g is None:
-                    raise Gone('пары уже нет — список обновлён')
+                    raise Gone('this video is already gone — the list has been refreshed')
                 if p[1] == 'open':
                     if not g['v']:
-                        raise LookupError('у этого превью нет видео')
+                        raise LookupError('this preview has no video')
                     open_file(g['v'][0][0], front=True)
                     self.reply(200, {'ok': True})
                 else:
                     delete_group(gid)
                     self.reply(200, {'ok': True, 'trash': trash_stats()})
             else:
-                self.reply(404, {'error': 'не найдено'})
+                self.reply(404, {'error': 'not found'})
         except ConnectionError:
             self.close_connection = True
         except Fail as e:
@@ -2241,7 +2243,7 @@ def run_window(url, title, width=1600, height=1000):
     try:
         import webview
     except ImportError:
-        print('Для отдельного окна нужен pywebview: pip install pywebview (подробнее — в справке). Открываю в браузере.')
+        print('The app window needs pywebview: pip install pywebview. Opening in the browser.')
         return False
     api = WindowApi()
     try:
@@ -2252,7 +2254,7 @@ def run_window(url, title, width=1600, height=1000):
         # на Windows принудительно WebView2: запасной движок IE страницу не потянет
         webview.start(gui='edgechromium' if os.name == 'nt' else None)
     except Exception as e:  # noqa: BLE001 — любой сбой окна не должен убивать программу: есть браузер
-        print('Окно не открылось (%s: %s). Открываю в браузере.' % (type(e).__name__, e))
+        print('The window did not open (%s: %s). Opening in the browser.' % (type(e).__name__, e))
         return False
     return True
 
@@ -2260,11 +2262,12 @@ def run_window(url, title, width=1600, height=1000):
 # ───────────────────────── страница ─────────────────────────
 
 PAGE = r"""<!doctype html>
-<html lang="ru">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Video Manager</title>
+<title>VSPO</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%237c5cff'/%3E%3Cstop offset='1' stop-color='%231eaaff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='3' y='3' width='58' height='58' rx='14' fill='url(%23g)'/%3E%3Ccircle cx='32' cy='32' r='19' fill='%23fff'/%3E%3Cpath d='M26 22v20l16-10z' fill='%235476ff'/%3E%3C/svg%3E">
 <style>
 :root{color-scheme:dark;--bg:#2b2b2b;--cell:#363636;--well:#1e1e1e;--line:#474747;--text:#dcdcdc;--dim:#a0a0a0;--pick:#f2f2f2;--bad:#c9524e;--w:480px;--hh:52px}
 *{box-sizing:border-box}
@@ -2420,77 +2423,77 @@ code{padding:1px 6px;border-radius:4px;background:#00000040;font-family:Consolas
 </head>
 <body>
 <header>
-  <button id="rootb" title="Открыть другую папку"></button>
+  <button id="rootb" title="Open another folder"></button>
   <div id="tabs">
-    <button id="tab-p" class="tab on">Превью <span id="np" class="n"></span></button>
-    <button id="tab-v" class="tab">Видео без превью <span id="nv" class="n"></span></button>
+    <button id="tab-p" class="tab on">Previews <span id="np" class="n"></span></button>
+    <button id="tab-v" class="tab">Videos without previews <span id="nv" class="n"></span></button>
   </div>
   <span id="cnt"></span>
-  <button id="refresh" title="Перечитать папку: найти новые видео и превью, убрать пропавшие (F5)">Обновить</button>
-  <label class="op">Порядок
+  <button id="refresh" title="Reread the folder: find new videos and previews, drop missing ones (F5)">Refresh</button>
+  <label class="op">Sort
     <select id="srt">
-      <option value="name">по имени</option>
-      <option value="new">новые сверху</option>
-      <option value="old">старые сверху</option>
-      <option value="big">крупные сверху</option>
+      <option value="name">by name</option>
+      <option value="new">newest first</option>
+      <option value="old">oldest first</option>
+      <option value="big">largest first</option>
     </select>
   </label>
-  <label class="op">Размер превью <input id="sz" type="range" min="200" max="1600" step="20"></label>
-  <button id="und" class="op" disabled>Отменить удаление</button>
-  <button id="trash" hidden title="Файлы, которые вы удалили в галерее и которые ещё лежат в папке _на_удаление"></button>
-  <button id="tg" title="Показать или скрыть дерево папок">Папки</button>
-  <button id="redo" class="op" hidden title="Заменить превью в этой папке новыми: сетка, размер и вид задаются параметрами запуска. Старые превью уйдут в _на_удаление"></button>
-  <button id="orph" class="op" hidden title="Превью, у которых нет видео (на плитке отмечены «нет видео»), будут перенесены в _на_удаление. Ctrl+Z вернёт их"></button>
+  <label class="op">Tile size <input id="sz" type="range" min="200" max="1600" step="20"></label>
+  <button id="und" class="op" disabled>Undo delete</button>
+  <button id="trash" hidden title="Files you deleted in the gallery that are still in the _to_delete folder"></button>
+  <button id="tg" title="Show or hide the folder tree">Folders</button>
+  <button id="redo" class="op" hidden title="Replace the previews in this folder with new ones: grid, size and look come from the launch options. Old previews go to _to_delete"></button>
+  <button id="orph" class="op" hidden title="Previews that have no video (marked &quot;no video&quot; on the tile) will be moved to _to_delete. Ctrl+Z brings them back"></button>
   <div id="selbar" class="op" hidden>
     <span id="selcnt"></span>
-    <button id="sdel" class="danger" title="Перенести выбранные пары в _на_удаление (Del). Ctrl+Z вернёт все сразу"></button>
-    <button id="sredo" title="Заменить превью выбранных новыми"></button>
-    <button id="splay" title="Запустить выбранные видео в MPC"></button>
-    <button id="sall" title="Выделить все превью в этом списке (Ctrl+A)">Выбрать все</button>
-    <button id="snone" title="Снять выделение (Esc)">Снять выделение</button>
+    <button id="sdel" class="danger" title="Move the selected videos with their previews to _to_delete (Del). Ctrl+Z brings them all back"></button>
+    <button id="sredo" title="Replace the previews of the selected videos with new ones"></button>
+    <button id="splay" title="Play the selected videos in MPC"></button>
+    <button id="sall" title="Select all previews in this list (Ctrl+A)">Select all</button>
+    <button id="snone" title="Clear selection (Esc)">Clear selection</button>
   </div>
   <div id="jobbar" hidden>
     <div class="bar"><i id="vbar"></i></div>
-    <div class="jrow"><span id="vptxt"></span><button id="vstop" hidden>Остановить</button></div>
+    <div class="jrow"><span id="vptxt"></span><button id="vstop" hidden>Stop</button></div>
   </div>
   <span id="keys" class="op">
-    <span><kbd>Стрелки</kbd>выбор</span>
-    <span><kbd>Пробел</kbd>на весь экран</span>
-    <span><kbd>Enter</kbd>открыть видео</span>
-    <span><kbd>E</kbd>в проводнике</span>
-    <span><kbd>Del</kbd>удалить пару</span>
-    <span><kbd>PgUp PgDn</kbd>папки</span>
-    <span><kbd>X</kbd>выделить</span>
-    <span><kbd>Ctrl+Z</kbd>отменить</span>
+    <span><kbd>Arrows</kbd>select</span>
+    <span><kbd>Space</kbd>full screen</span>
+    <span><kbd>Enter</kbd>open video</span>
+    <span><kbd>E</kbd>show in Explorer</span>
+    <span><kbd>Del</kbd>delete video</span>
+    <span><kbd>PgUp PgDn</kbd>folders</span>
+    <span><kbd>X</kbd>select</span>
+    <span><kbd>Ctrl+Z</kbd>undo</span>
   </span>
 </header>
 <div id="rootp" hidden>
-  <p>Открыта папка: <span id="rooti" class="dim"></span></p>
+  <p>Current folder: <span id="rooti" class="dim"></span></p>
   <div id="rootl"></div>
   <div class="acts">
-    <button id="rpick" class="go">Выбрать другую папку…</button>
-    <button id="rcancel">Отмена</button>
+    <button id="rpick" class="go">Choose another folder…</button>
+    <button id="rcancel">Cancel</button>
   </div>
 </div>
 <div id="trashp" hidden>
   <p id="trashi"></p>
   <div class="acts">
-    <button id="tpurge" class="danger">Удалить насовсем</button>
-    <button id="topen">Открыть папку</button>
-    <button id="tcancel">Отмена</button>
+    <button id="tpurge" class="danger">Delete permanently</button>
+    <button id="topen">Open folder</button>
+    <button id="tcancel">Cancel</button>
   </div>
 </div>
 <div id="wrap">
   <aside id="tree">
-    <label class="deep"><input type="checkbox" id="deep"> включая подпапки</label>
+    <label class="deep"><input type="checkbox" id="deep"> include subfolders</label>
     <div id="fact">
-      <button id="fexp" title="Открыть выбранную папку в проводнике">Открыть в проводнике</button>
-      <button id="fplay">Воспроизвести в MPC</button>
-      <button id="fmpc">Добавить в плейлист MPC</button>
+      <button id="fexp" title="Open the selected folder in Explorer">Open in Explorer</button>
+      <button id="fplay">Play in MPC</button>
+      <button id="fmpc">Add to MPC playlist</button>
     </div>
     <div id="fact2">
-      <button id="fdel" class="danger" title="Перенести выбранную папку целиком (с подпапками и любыми файлами) в _на_удаление">Удалить папку…</button>
-      <button id="fempty" title="Найти папки без файлов и перенести их в _на_удаление">Пустые папки…</button>
+      <button id="fdel" class="danger" title="Move the selected folder with everything in it (subfolders and any files) to _to_delete">Delete folder…</button>
+      <button id="fempty" title="Find folders without files and move them to _to_delete">Empty folders…</button>
     </div>
     <nav id="dirs"></nav>
   </aside>
@@ -2500,9 +2503,9 @@ code{padding:1px 6px;border-radius:4px;background:#00000040;font-family:Consolas
     <section id="vl">
       <div id="vtool">
         <span id="vsel"></span>
-        <button id="vall" title="Отметить все видео в этом списке, кроме папок, помеченных «не создавать»">Выбрать все</button>
-        <button id="vnone">Снять все</button>
-        <button id="vmake" class="go">Создать превью</button>
+        <button id="vall" title="Check all videos in this list except folders marked &quot;skip previews&quot;">Select all</button>
+        <button id="vnone">Select none</button>
+        <button id="vmake" class="go">Create previews</button>
       </div>
       <div id="vnote" hidden></div>
       <p id="vfmt" class="dim"></p>
@@ -2520,39 +2523,39 @@ code{padding:1px 6px;border-radius:4px;background:#00000040;font-family:Consolas
     <div id="cticks"></div>
     <div id="crow">
       <span id="cinfo"></span>
-      <button id="chead" title="Вырезать всё от начала видео до курсора">Отрезать начало</button>
-      <button id="ctail" title="Вырезать всё от курсора до конца видео">Отрезать конец</button>
-      <button id="cin" title="Начало вырезаемого куска — там, где курсор (I)">Начало куска (I)</button>
-      <button id="cout" title="Конец вырезаемого куска — там, где курсор (O)">Конец куска (O)</button>
-      <button id="cdel" title="Убрать выбранный кусок из вырезаемых (Del)">Не вырезать кусок</button>
-      <button id="cclr">Сбросить</button>
-      <button id="cgo" class="go">Обрезать…</button>
-      <button id="cstop" hidden>Остановить</button>
-      <button id="cexit" title="Закрыть обрезку (Esc)">Закрыть</button>
+      <button id="chead" title="Cut everything from the start of the video to the cursor">Cut start</button>
+      <button id="ctail" title="Cut everything from the cursor to the end of the video">Cut end</button>
+      <button id="cin" title="Start of a piece to cut at the cursor (I)">Piece start (I)</button>
+      <button id="cout" title="End of a piece to cut at the cursor (O)">Piece end (O)</button>
+      <button id="cdel" title="Unmark the selected piece (Del)">Keep piece</button>
+      <button id="cclr">Reset</button>
+      <button id="cgo" class="go">Trim…</button>
+      <button id="cstop" hidden>Stop</button>
+      <button id="cexit" title="Close trimming (Esc)">Close</button>
     </div>
-    <p id="chelp" class="dim">Протяните мышью по шкале — этот кусок будет вырезан; края кусков можно двигать. Клик — курсор.
-      ←/→ — курсор на 1 с, с Shift — на 10 с, с Ctrl — на минуту. Красное вырезается; полосатое останется:
-      без перекодирования оставшийся кусок начинается с ключевого кадра.</p>
+    <p id="chelp" class="dim">Drag on the timeline to mark a piece to cut; piece edges can be moved. Click sets the cursor.
+      ←/→ move the cursor by 1 s, with Shift by 10 s, with Ctrl by a minute. Red is cut; striped stays:
+      without re-encoding a kept piece has to start at a keyframe.</p>
   </div>
   <div id="vb">
-    <button id="prev" title="Назад (←)">‹</button>
-    <button id="next" title="Вперёд (→)">›</button>
+    <button id="prev" title="Previous (←)">‹</button>
+    <button id="next" title="Next (→)">›</button>
     <span id="vname"></span>
     <span id="vpos" class="dim"></span>
     <span id="vmeta"></span>
-    <button id="pdir" title="Предыдущая папка ([)">Пред. папка</button>
-    <button id="ndir" title="Следующая папка (])">След. папка</button>
-    <button id="vpk" title="Выбрать для групповых действий (X)">Выбрать (X)</button>
-    <button id="vopen" title="Открыть видео (Enter)">Открыть видео</button>
-    <button id="vcut" title="Вырезать лишнее из видео: начало, конец или куски из середины (C)">Обрезать видео</button>
-    <button id="vdel" class="del" title="Удалить пару (Del)">Удалить пару</button>
-    <button id="vclose" title="Выйти (Esc). Клавиша I скрывает эту панель">Закрыть</button>
+    <button id="pdir" title="Previous folder ([)">Prev. folder</button>
+    <button id="ndir" title="Next folder (])">Next folder</button>
+    <button id="vpk" title="Select for bulk actions (X)">Select (X)</button>
+    <button id="vopen" title="Open video (Enter)">Open video</button>
+    <button id="vcut" title="Cut unwanted parts: the start, the end or pieces in the middle (C)">Trim video</button>
+    <button id="vdel" class="del" title="Delete the video with its preview (Del)">Delete video</button>
+    <button id="vclose" title="Close (Esc). The I key hides this bar">Close</button>
   </div>
 </div>
 <div id="dlg" hidden>
   <div class="box">
     <p id="dtxt"></p>
-    <div class="acts"><button id="dno">Отмена</button><button id="dok" class="go">Продолжить</button></div>
+    <div class="acts"><button id="dno">Cancel</button><button id="dok" class="go">Continue</button></div>
   </div>
 </div>
 <div id="toast"></div>
@@ -2626,17 +2629,17 @@ const label = it => {
   return rel ? rel + '/' + it.name : it.name;
 };
 
-const fmtSize = n => n >= 2 ** 30 ? (n / 2 ** 30).toFixed(2).replace('.', ',') + ' ГБ'
-  : n >= 2 ** 20 ? Math.round(n / 2 ** 20) + ' МБ' : Math.max(1, Math.round(n / 1024)) + ' КБ';
-const fmtDate = t => new Date(t * 1000).toLocaleDateString('ru-RU');
-const plural = (n, f) => f[n % 10 === 1 && n % 100 !== 11 ? 0 : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 10 || n % 100 >= 20) ? 1 : 2];
-const fmtEta = s => s < 90 ? Math.max(5, Math.round(s)) + ' с' : s < 5400 ? Math.round(s / 60) + ' мин'
-  : Math.floor(s / 3600) + ' ч ' + Math.round(s % 3600 / 60) + ' мин';
+const fmtSize = n => n >= 2 ** 30 ? (n / 2 ** 30).toFixed(2) + ' GB'
+  : n >= 2 ** 20 ? Math.round(n / 2 ** 20) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+const fmtDate = t => new Date(t * 1000).toLocaleDateString('en-CA');  // 2026-10-25
+const plural = (n, f) => f[n === 1 ? 0 : 1];
+const fmtEta = s => s < 90 ? Math.max(5, Math.round(s)) + ' s' : s < 5400 ? Math.round(s / 60) + ' min'
+  : Math.floor(s / 3600) + ' h ' + Math.round(s % 3600 / 60) + ' min';
 
 function parts(it) {
   if (!it.nv) return [];
   const r = [fmtSize(it.size), fmtDate(it.mtime)];
-  if (it.nv > 1) r.push('видео: ' + it.nv);
+  if (it.nv > 1) r.push('videos: ' + it.nv);
   return r;
 }
 const spans = it => parts(it).map(s => '<span>' + s + '</span>').join('');
@@ -2658,7 +2661,7 @@ async function api(path, post, body) {
   const r = await fetch(q(path), opt);
   const j = await r.json().catch(() => ({}));
   if (!r.ok) {
-    const err = new Error(j.error || 'ошибка ' + r.status);
+    const err = new Error(j.error || 'error ' + r.status);
     err.resync = !!j.resync;
     throw err;
   }
@@ -2731,8 +2734,8 @@ function crossFolder(dir, last, quiet) {
   if (t === undefined) {
     if (!quiet) {
       const multi = new Set(items.map(i => i.dir)).size > 1;
-      toast(multi ? 'Показано сразу несколько папок: выберите одну слева'
-        : dir > 0 ? 'Дальше папок с превью нет' : 'Раньше папок с превью нет');
+      toast(multi ? 'Several folders are shown at once: pick one on the left'
+        : dir > 0 ? 'No more folders with previews ahead' : 'No folders with previews before this one');
     }
     return false;
   }
@@ -2741,7 +2744,7 @@ function crossFolder(dir, last, quiet) {
   let k = -1;
   items.forEach((it, i) => { if (it.dir === t && (last || k < 0)) k = i; });
   select(k < 0 ? 0 : k);
-  toast('Папка: ' + (t || ROOT));
+  toast('Folder: ' + (t || ROOT));
   return true;
 }
 
@@ -2753,13 +2756,13 @@ function tile(it) {
   if (it.err) f.classList.add('bad');
   if (picked.has(it.id)) f.classList.add('pick');
   f.innerHTML =
-    '<div class="im"><span class="pk" title="Выделить: клик здесь, X или Ctrl+клик по превью; Shift+клик — диапазон"></span><img loading="lazy" alt="" src="' + purl(it) + '">' +
-    (it.nv ? '' : '<b class="nov">нет видео</b>') + '</div>' +
+    '<div class="im"><span class="pk" title="Select: click here, X or Ctrl+click the preview; Shift+click selects a range"></span><img loading="lazy" alt="" src="' + purl(it) + '">' +
+    (it.nv ? '' : '<b class="nov">no video</b>') + '</div>' +
     '<figcaption>' + (it.err ? '<div class="err">' + esc(it.err) + '</div>' : '') +
     '<div class="nm" title="' + esc(full(it)) + '">' + esc(label(it)) + '</div>' +
     '<div class="row">' + spans(it) +
-    '<span class="bt"><button data-a="open"' + (it.nv ? '' : ' disabled') + '>Открыть видео</button>' +
-    '<button data-a="del" class="del">Удалить пару</button></span></div></figcaption>';
+    '<span class="bt"><button data-a="open"' + (it.nv ? '' : ' disabled') + '>Open video</button>' +
+    '<button data-a="del" class="del" title="' + (it.nv ? 'Delete the video with its preview' : 'Delete the preview') + ' (Del)">Delete</button></span></div></figcaption>';
   return f;
 }
 
@@ -2767,15 +2770,15 @@ function stat() {
   $('#np').textContent = all.length;
   $('#nv').textContent = videos.length;
   if (mode === 'previews') {
-    $('#cnt').textContent = items.length + ' превью' + (items.length !== all.length ? ' из ' + all.length : '');
+    $('#cnt').textContent = items.length + ' ' + plural(items.length, ['preview', 'previews']) + (items.length !== all.length ? ' of ' + all.length : '');
   }
-  $('#und').textContent = 'Отменить удаление' + (undoN ? ' (' + undoN + ')' : '');
+  $('#und').textContent = 'Undo delete' + (undoN ? ' (' + undoN + ')' : '');
   $('#und').disabled = !undoN;
   redoStat();
   $('#empty').hidden = items.length > 0;
   $('#empty').textContent = all.length
-    ? 'В этой папке превью нет. Клавиши [ и ] переключают папки.'
-    : videos.length ? 'Превью пока нет. Создайте их во вкладке «Видео без превью».' : 'Превью не осталось.';
+    ? 'No previews in this folder. The [ and ] keys switch folders.'
+    : videos.length ? 'No previews yet. Create them on the "Videos without previews" tab.' : 'No previews left.';
 }
 
 function render() {
@@ -2813,7 +2816,7 @@ function select(i, scroll = true) {
 function go(n) {
   if (viewer && (n < 0 || n >= items.length)) {
     const fwd = n >= items.length;
-    if (!crossFolder(fwd ? 1 : -1, !fwd, true)) toast(fwd ? 'Это последнее превью' : 'Это первое превью');
+    if (!crossFolder(fwd ? 1 : -1, !fwd, true)) toast(fwd ? 'This is the last preview' : 'This is the first preview');
     return;
   }
   select(n);
@@ -2830,13 +2833,14 @@ function showViewer() {
   $('#vi').src = purl(it);
   $('#vname').textContent = full(it);
   $('#vname').title = full(it);
-  $('#vpk').textContent = picked.has(it.id) ? '✓ Выбрано' : 'Выбрать (X)';
-  $('#vpos').textContent = (cur + 1) + ' из ' + items.length;
+  $('#vpk').textContent = picked.has(it.id) ? '✓ Selected' : 'Select (X)';
+  $('#vpos').textContent = (cur + 1) + ' of ' + items.length;
   $('#vmeta').innerHTML = spans(it);
   $('#vopen').disabled = !it.nv;
   $('#vcut').disabled = it.nv !== 1;
   $('#verr').hidden = !it.err;
-  $('#verr').textContent = it.err ? 'Не удалено: ' + it.err : '';
+  $('#verr').textContent = it.err ? 'Not deleted: ' + it.err : '';
+  $('#vdel').textContent = it.nv ? 'Delete video' : 'Delete preview';
   for (const d of [1, 2, -1]) if (items[cur + d]) new Image().src = purl(items[cur + d]);
 }
 
@@ -2897,15 +2901,15 @@ const removedOf = c => Math.max(0, Math.max(c.a, keepStart(c)) - c.a);
 async function openCut() {
   const it = items[cur];
   if (!viewer || !it || C) return;
-  if (!it.nv) { toast('У этого превью нет видео', true); return; }
-  if (it.nv > 1) { toast('У пары несколько видеофайлов: непонятно, какой обрезать', true); return; }
-  if (!ff.ok) { toast('ffmpeg не найден: обрезать нечем', true); return; }
-  if (job.running) { toast('Идёт создание превью: обрезать можно после него', true); return; }
+  if (!it.nv) { toast('This preview has no video', true); return; }
+  if (it.nv > 1) { toast('Several video files share this name: unclear which one to trim', true); return; }
+  if (!ff.ok) { toast('ffmpeg not found: cannot trim', true); return; }
+  if (job.running) { toast('Previews are being created: trim after it finishes', true); return; }
   let info;
   try {
     info = await api('/api/cut/info', true, {id: it.id});
   } catch (e) {
-    toast('Обрезка недоступна: ' + e.message, true);
+    toast('Trimming unavailable: ' + e.message, true);
     return;
   }
   if (!viewer || items[cur] !== it) return;
@@ -2920,8 +2924,8 @@ async function openCut() {
 
 async function closeCut(force) {
   if (!C) return;
-  if (!force && !C.running && C.cuts.length && !await ask('Закрыть обрезку? Отмеченные куски не сохранятся.', 'Закрыть')) return;
-  if (C && C.running) toast('Обрезка продолжается: когда закончится, превью пересоздастся');
+  if (!force && !C.running && C.cuts.length && !await ask('Close trimming? The marked pieces will be lost.', 'Close')) return;
+  if (C && C.running) toast('Trimming continues: the preview will be recreated when it finishes');
   C = null;
   hidePop();
   $('#cut').hidden = true;
@@ -2985,7 +2989,7 @@ function renderCut() {
     const hatch = left > 0.01 ? '<i style="width:' + (100 * left / (c.b - c.a)) + '%"></i>' : '';
     return '<div class="creg' + (i === C.sel ? ' on' : '') + '" data-i="' + i + '" style="left:' + tpos(c.a) +
       ';width:' + tpos(c.b - c.a) + '" title="' + fmtT(c.a, true) + ' – ' + fmtT(c.b, true) +
-      (left > 0.01 ? ' (останется ' + left.toFixed(1) + ' с до ключевого кадра)' : '') + '">' + hatch + '</div>';
+      (left > 0.01 ? ' (' + left.toFixed(1) + ' s up to the keyframe stays)' : '') + '">' + hatch + '</div>';
   }).join('');
   $('#ccur').style.left = tpos(C.cur);
   $('#cmark').hidden = C.mark === null;
@@ -2994,12 +2998,12 @@ function renderCut() {
   let t;
   if (C.running) {
     const st = C.status || {};
-    t = 'Обрезка: ' + (st.stage || 'подготовка') + (st.stage === 'обрезка' ? ' ' + (st.pct || 0) + '%' : '') + '…';
+    t = 'Trimming: ' + (st.stage || 'preparing') + (st.stage === 'cutting' ? ' ' + (st.pct || 0) + '%' : '') + '…';
   } else {
-    t = 'Курсор <b>' + fmtT(C.cur, true) + '</b> · ' + (n
-      ? 'вырезается ' + n + ' ' + plural(n, ['кусок', 'куска', 'кусков']) + ', останется <b>' + fmtT(kept) + '</b> из ' + fmtT(C.d)
-      : 'длительность ' + fmtT(C.d) + ' — отметьте, что вырезать');
-    if (C.mark !== null) t += ' · начало куска: ' + fmtT(C.mark, true) + ', поставьте конец (O)';
+    t = 'Cursor <b>' + fmtT(C.cur, true) + '</b> · ' + (n
+      ? 'cutting ' + n + ' ' + plural(n, ['piece', 'pieces']) + ', <b>' + fmtT(kept) + '</b> of ' + fmtT(C.d) + ' stays'
+      : 'duration ' + fmtT(C.d) + ' — mark what to cut');
+    if (C.mark !== null) t += ' · piece start: ' + fmtT(C.mark, true) + ', set the end (O)';
   }
   $('#cinfo').innerHTML = t;
   for (const b of ['#chead', '#ctail', '#cin', '#cout', '#cclr']) $(b).disabled = C.running;
@@ -3011,7 +3015,7 @@ function renderCut() {
 }
 
 function addCut(a, b) {
-  if (b - a < 0.2) { toast('Слишком короткий кусок'); return; }
+  if (b - a < 0.2) { toast('The piece is too short'); return; }
   const c = {a, b};
   C.cuts.push(c);
   C.sel = C.cuts.length - 1;
@@ -3025,7 +3029,7 @@ function moveCur(t) {
   popAt(C.cur, r.left + r.width * C.cur / C.d);
 }
 function cutOut() {
-  if (C.mark === null) { toast('Сначала поставьте начало куска: клавиша I'); return; }
+  if (C.mark === null) { toast('Set the piece start first: the I key'); return; }
   const a = Math.min(C.mark, C.cur), b = Math.max(C.mark, C.cur);
   C.mark = null;
   addCut(a, b);
@@ -3162,10 +3166,10 @@ async function startCut() {
   if (!C || C.running || !C.cuts.length) return;
   const it = items.find(x => x.id === C.id), n = C.cuts.length;
   const kept = C.d - C.cuts.reduce((s, c) => s + removedOf(c), 0);
-  if (!await ask('Обрезать «' + (it ? full(it) : C.info.file) + '»?\n' +
-      'Останется ' + fmtT(kept) + ' из ' + fmtT(C.d) + ' (вырезается ' + n + ' ' + plural(n, ['кусок', 'куска', 'кусков']) + ').\n' +
-      'Без перекодирования: оставшиеся куски начинаются с ближайшего ключевого кадра, до пары секунд лишнего может остаться.\n' +
-      'Оригинал уйдёт в _на_удаление, Ctrl+Z вернёт его вместе со старым превью. Превью пересоздастся.', 'Обрезать')) return;
+  if (!await ask('Trim "' + (it ? full(it) : C.info.file) + '"?\n' +
+      fmtT(kept) + ' of ' + fmtT(C.d) + ' will stay (cutting ' + n + ' ' + plural(n, ['piece', 'pieces']) + ').\n' +
+      'No re-encoding: kept pieces start at the nearest keyframe, so up to a couple of extra seconds may stay.\n' +
+      'The original goes to _to_delete, Ctrl+Z restores it together with the old preview. The preview will be recreated.', 'Trim')) return;
   if (!C) return;
   try {
     C.status = await api('/api/cut/start', true, {id: C.id, cuts: C.cuts.map(c => [c.a, c.b])});
@@ -3175,7 +3179,7 @@ async function startCut() {
     renderCut();
     cutWatch();
   } catch (e) {
-    toast('Не обрезано: ' + e.message, true);
+    toast('Not trimmed: ' + e.message, true);
   }
 }
 function cutWatch() { if (!cutTimer) cutTimer = setTimeout(cutTick, 500); }
@@ -3190,20 +3194,20 @@ async function cutTick() {
   }
   if (C && C.id === s.id) { C.status = s; C.running = s.running; renderCut(); }
   if (s.running) { cutWatch(); return; }
-  if (s.error) { toast('Не обрезано: ' + s.error, true); return; }
-  toast('Обрезано: ' + s.name + '. ' + (s.note || 'Превью пересоздаётся…'), !!s.note);
+  if (s.error) { toast('Not trimmed: ' + s.error, true); return; }
+  toast('Trimmed: ' + s.name + '. ' + (s.note || 'Recreating the preview…'), !!s.note);
   if (C && C.id === s.id) closeCut(true);
   await load(s.id).catch(() => {});
 }
 
-$('#chead').onclick = () => { if (C.cur > 0.2) addCut(0, C.cur); else toast('Поставьте курсор туда, где начинается нужное'); };
-$('#ctail').onclick = () => { if (C.cur < C.d - 0.2) addCut(C.cur, C.d); else toast('Поставьте курсор туда, где кончается нужное'); };
+$('#chead').onclick = () => { if (C.cur > 0.2) addCut(0, C.cur); else toast('Put the cursor where the wanted part begins'); };
+$('#ctail').onclick = () => { if (C.cur < C.d - 0.2) addCut(C.cur, C.d); else toast('Put the cursor where the wanted part ends'); };
 $('#cin').onclick = () => { C.mark = C.cur; renderCut(); };
 $('#cout').onclick = cutOut;
 $('#cdel').onclick = delCut;
 $('#cclr').onclick = () => { C.cuts = []; C.sel = -1; C.mark = null; renderCut(); };
 $('#cgo').onclick = startCut;
-$('#cstop').onclick = () => api('/api/cut/stop', true).catch(e => toast('Не остановлено: ' + e.message, true));
+$('#cstop').onclick = () => api('/api/cut/stop', true).catch(e => toast('Not stopped: ' + e.message, true));
 $('#cexit').onclick = () => closeCut();
 
 /* ───── действия ───── */
@@ -3245,7 +3249,7 @@ function failItem(it, msg) {
     grid.replaceChild(f, grid.children[i]);
   }
   if (viewer && items[cur] === it) showViewer();
-  else toast('Не удалено: ' + msg, true);
+  else toast('Not deleted: ' + msg, true);
 }
 
 async function removeCur() {
@@ -3284,15 +3288,15 @@ async function removeCur() {
       if (!crossFolder(1, false, true)) {
         if (items.length) {
           select(items.length - 1);
-          toast('Удалено. Ctrl+Z вернёт пару');
+          toast('Deleted. Ctrl+Z brings it back');
         } else if (!crossFolder(-1, true, true)) {
           closeViewer();
-          toast('Превью закончились');
+          toast('No previews left');
         }
       }
     } else {
       select(cur);
-      if (viewer) toast('Удалено. Ctrl+Z вернёт пару');
+      if (viewer) toast('Deleted. Ctrl+Z brings it back');
     }
   } catch (e) {
     f0.classList.remove('wait');
@@ -3312,9 +3316,9 @@ async function undoLast() {
     if (j.trash) { trashInfo = j.trash; trashStat(); }
     await load(j.id);
     select(cur);
-    toast('Пара возвращена');
+    toast('Restored');
   } catch (e) {
-    toast('Не отменено: ' + e.message, true);
+    toast('Not undone: ' + e.message, true);
     if (e.resync) await load().catch(() => {});
   }
   busy = false;
@@ -3325,9 +3329,9 @@ async function openCur() {
   if (!it || !it.nv) return;
   try {
     await api('/api/open/' + it.id, true);
-    toast('Открываю видео');
+    toast('Opening the video');
   } catch (e) {
-    toast('Не открыто: ' + e.message, true);
+    toast('Not opened: ' + e.message, true);
   }
 }
 
@@ -3472,7 +3476,7 @@ function vrow(v) {
     '<label><input type="checkbox" data-v="' + v.id + '"' + (isSel(v) ? ' checked' : '') + '>' +
     '<span class="vn" title="' + esc(full({dir: v.dir, name: v.file || v.name})) + '">' + esc(v.file || v.name) + '</span></label>' +
     '<span class="vs">' + fmtSize(v.size) + '</span><span class="vd">' + fmtDate(v.mtime) + '</span>' +
-    '<button data-a="play" title="Открыть видео в плеере">Открыть</button>' +
+    '<button data-a="play" title="Open the video in the player">Open</button>' +
     (bad ? '<div class="verr">' + esc(bad) + '</div>' : '') + '</div>';
 }
 
@@ -3487,10 +3491,10 @@ function renderVideos() {
     const n = g.arr.length, s = g.arr.filter(isSel).length;
     return '<div class="grp"><label class="gh"><input type="checkbox" data-g="' + esc(g.d) + '" data-n="' + n + '" data-s="' + s + '"' +
       (s === n ? ' checked' : '') + '><span>' + esc(g.d || ROOT) + '</span><span class="gc">' + n + '</span>' +
-      (skipDirs.has(g.d) ? '<span class="tag">превью не создавать</span>' : '') + '</label>' +
+      (skipDirs.has(g.d) ? '<span class="tag">skip previews</span>' : '') + '</label>' +
       g.arr.map(vrow).join('') + '</div>';
   }).join('') || '<p class="dim pad">' +
-    (videos.length ? 'В этой папке нет видео без превью.' : 'У всех видео есть превью.') + '</p>';
+    (videos.length ? 'No videos without previews in this folder.' : 'All videos have previews.') + '</p>';
   document.querySelectorAll('#vrows input[data-g]').forEach(cb => {
     const s = +cb.dataset.s;
     cb.indeterminate = s > 0 && s < +cb.dataset.n;
@@ -3500,54 +3504,55 @@ function renderVideos() {
 
 function vstat() {
   const list = videos.filter(inView), picked = list.filter(isSel);
-  $('#vsel').textContent = 'Выбрано ' + picked.length + ' из ' + list.length;
+  $('#vsel').textContent = 'Selected ' + picked.length + ' of ' + list.length;
   if (mode === 'videos') {
-    $('#cnt').textContent = list.length + ' видео без превью' + (list.length !== videos.length ? ' из ' + videos.length : '');
+    $('#cnt').textContent = list.length + ' ' + plural(list.length, ['video', 'videos']) + ' without previews' + (list.length !== videos.length ? ' of ' + videos.length : '');
   }
   const b = $('#vmake');
   b.disabled = !picked.length || job.running || !ff.ok;
-  b.textContent = job.running ? 'Идёт создание…' : 'Создать превью' + (picked.length ? ' (' + picked.length + ')' : '');
+  b.textContent = job.running ? 'Creating…' : 'Create previews' + (picked.length ? ' (' + picked.length + ')' : '');
   const note = $('#vnote');
   if (!ff.ok) {
     note.hidden = false;
-    note.innerHTML = 'Для создания превью нужен ffmpeg, но он не найден. Установите его (в Windows: ' +
-      '<code>winget install Gyan.FFmpeg</code>), откройте терминал заново и перезапустите скрипт. ' +
-      'Если ffmpeg уже установлен, но не добавлен в PATH, запустите скрипт с параметром ' +
-      '<code>--ffmpeg "C:\\путь\\ffmpeg.exe"</code>.';
+    note.innerHTML = 'Creating previews needs ffmpeg, but it was not found. Install it (on Windows: ' +
+      '<code>winget install Gyan.FFmpeg</code>), reopen the terminal and restart the program, ' +
+      'or put <code>ffmpeg.exe</code> and <code>ffprobe.exe</code> next to it. ' +
+      'If ffmpeg is installed but not in PATH, start the program with ' +
+      '<code>--ffmpeg "C:\\path\\ffmpeg.exe"</code>.';
   } else if (!ff.drawtext) {
     note.hidden = false;
-    note.textContent = 'В этой сборке ffmpeg нет подписей на кадрах (фильтр drawtext или шрифт не найдены): ' +
-      'превью будут без времени и заголовка. Шрифт можно указать параметром --font ПУТЬ.';
+    note.textContent = 'This ffmpeg build cannot draw text on frames (the drawtext filter or a font is missing): ' +
+      'previews will have no timestamps or header. A font can be set with --font PATH.';
   } else {
     note.hidden = true;
   }
-  $('#vfmt').textContent = 'Формат превью: сетка ' + opts.cols + '×' + opts.rows + ', ширина ' + opts.width +
-    ' px, ' + (opts.header ? 'заголовок и таймкоды' : 'только таймкоды') + '. Меняется параметрами --cols --rows --width --header. Декодирование видео: ' + (opts.hw || 'процессор') + '.';
+  $('#vfmt').textContent = 'Preview format: ' + opts.cols + '×' + opts.rows + ' grid, ' + opts.width +
+    ' px wide, ' + (opts.header ? 'header and timestamps' : 'timestamps only') + '. Change it with --cols --rows --width --header. Video decoding: ' + (opts.hw || 'CPU') + '.';
   const g = $('#vign');
   g.hidden = !ign.files;
-  g.textContent = ign.files ? 'Игнорируются файлы ' + ign.exts.join(', ') + ': пропущено ' + ign.files +
-    '. Список расширений задаёт параметр --ignore-ext.' : '';
+  g.textContent = ign.files ? 'Ignoring ' + ign.exts.join(', ') + ' files: ' + ign.files + ' skipped' +
+    '. The extension list is set with --ignore-ext.' : '';
 }
 
 function redoStat() {
   const n = items.filter(i => i.nv).length, b = $('#redo');
   b.hidden = !n || mode !== 'previews' || !ff.ok;
   b.disabled = job.running;
-  b.textContent = 'Пересоздать превью (' + n + ')';
+  b.textContent = 'Recreate previews (' + n + ')';
   const k = items.filter(i => !i.nv).length, o = $('#orph');
   o.hidden = !k || mode !== 'previews';
-  o.textContent = 'Убрать превью без видео (' + k + ')';
+  o.textContent = 'Remove previews without video (' + k + ')';
 }
 
 function renderJob() {
   const j = job, fails = Object.keys(j.failed).length;
   $('#jobbar').hidden = !(j.running || j.total);
   $('#vbar').style.width = (j.total ? Math.round(100 * j.done / j.total) : 0) + '%';
-  let t = (j.redo ? 'Пересоздано ' : 'Создано ') + j.ok + ' из ' + j.total;
-  if (fails) t += ', ошибок: ' + fails;
-  if (j.running && j.active.length) t += '. Сейчас: ' + j.active.slice(0, 2).join(', ');
-  if (j.running && j.done >= 3) t += '. Осталось около ' + fmtEta(j.elapsed / j.done * (j.total - j.done));
-  if (!j.running && j.total) t = (j.stopped ? 'Остановлено. ' : 'Готово. ') + t;
+  let t = (j.redo ? 'Recreated ' : 'Created ') + j.ok + ' of ' + j.total;
+  if (fails) t += ', errors: ' + fails;
+  if (j.running && j.active.length) t += '. Now: ' + j.active.slice(0, 2).join(', ');
+  if (j.running && j.done >= 3) t += '. About ' + fmtEta(j.elapsed / j.done * (j.total - j.done)) + ' left';
+  if (!j.running && j.total) t = (j.stopped ? 'Stopped. ' : 'Done. ') + t;
   $('#vptxt').textContent = t;
   $('#vstop').hidden = !j.running;
   vstat();
@@ -3565,11 +3570,11 @@ async function startMake(ids, redo) {
     renderJob();
     watchJob();
   } catch (e) {
-    toast('Не запущено: ' + e.message, true);
+    toast('Not started: ' + e.message, true);
   }
 }
 async function stopMake() {
-  try { job = await api('/api/make/stop', true); renderJob(); } catch (e) { toast('Не остановлено: ' + e.message, true); }
+  try { job = await api('/api/make/stop', true); renderJob(); } catch (e) { toast('Not stopped: ' + e.message, true); }
 }
 function watchJob() { if (!jobTimer) jobTimer = setTimeout(tickJob, 1000); }
 async function tickJob() {
@@ -3586,11 +3591,11 @@ async function tickJob() {
     } else if (wasRunning) {
       wasRunning = false;
       renderJob();
-      toast((job.stopped ? 'Остановлено. ' : 'Готово. ') + (job.redo ? 'Пересоздано превью: ' : 'Создано превью: ') + job.ok +
-        (fails ? ', ошибок: ' + fails + ' (отмечены красным в списке)' : ''), fails > 0);
+      toast((job.stopped ? 'Stopped. ' : 'Done. ') + (job.redo ? 'Previews recreated: ' : 'Previews created: ') + job.ok +
+        (fails ? ', errors: ' + fails + ' (marked red in the list)' : ''), fails > 0);
     }
   } catch (e) {
-    toast('Нет связи с сервером: ' + e.message, true);
+    toast('No connection to the server: ' + e.message, true);
   }
 }
 
@@ -3615,8 +3620,8 @@ $('#vrows').onclick = e => {
   const b = e.target.closest('button[data-a="play"]');
   if (!b) return;
   api('/api/open/' + b.closest('.vr').dataset.id, true)
-    .then(() => toast('Открываю видео'))
-    .catch(err => toast('Не открыто: ' + err.message, true));
+    .then(() => toast('Opening the video'))
+    .catch(err => toast('Not opened: ' + err.message, true));
 };
 $('#vall').onclick = () => {
   videos.filter(inView).forEach(v => { if (!skipDirs.has(v.dir)) sel.delete(v.id); });
@@ -3630,9 +3635,9 @@ $('#vmake').onclick = () => startMake();
 $('#redo').onclick = async () => {
   const ids = items.filter(i => i.nv).map(i => i.id);
   if (!ids.length || job.running) return;
-  const where = folder ? 'в папке «' + folder + '»' + (deep ? ' и подпапках' : '') : 'во всех папках';
-  const yes = await ask('Пересоздать превью ' + where + ': ' + ids.length + ' шт.?\n\nФормат: сетка ' + opts.cols + '×' + opts.rows + ', ' +
-    opts.width + ' px, ' + (opts.header ? 'с заголовком' : 'только таймкоды') + '.\nСтарые превью будут перенесены в _на_удаление, видео не затрагиваются.', 'Пересоздать');
+  const where = folder ? 'in "' + folder + '"' + (deep ? ' and its subfolders' : '') : 'in all folders';
+  const yes = await ask('Recreate ' + ids.length + ' ' + plural(ids.length, ['preview', 'previews']) + ' ' + where + '?\n\nFormat: ' + opts.cols + '×' + opts.rows + ' grid, ' +
+    opts.width + ' px, ' + (opts.header ? 'with header' : 'timestamps only') + '.\nOld previews will be moved to _to_delete, videos are not touched.', 'Recreate');
   if (yes) startMake(ids, true);
 };
 $('#vstop').onclick = stopMake;
@@ -3643,8 +3648,8 @@ let trashTimer = 0;
 function trashStat() {
   const n = trashInfo.files, b = $('#trash');
   b.hidden = !n;
-  b.textContent = 'На удаление: ' + n + ' ' + plural(n, ['файл', 'файла', 'файлов']) + ', ' + fmtSize(trashInfo.bytes) +
-    (trashInfo.pending ? ' (считаю…)' : '');
+  b.textContent = 'To delete: ' + n + ' ' + plural(n, ['file', 'files']) + ', ' + fmtSize(trashInfo.bytes) +
+    (trashInfo.pending ? ' (counting…)' : '');
   if (!n) $('#trashp').hidden = true;
   if (trashInfo.pending && !trashTimer) {   // подсчёт идёт на сервере в фоне (по сети он долгий): спрашиваем, пока не закончится
     trashTimer = setTimeout(async () => {
@@ -3658,9 +3663,9 @@ function trashStat() {
 
 function rootStat() {
   const b = $('#rootb');
-  b.textContent = 'Папка: ' + (ROOT || '—') + ' ▾';
-  b.title = 'Открыта папка ' + ROOT_PATH + '. Нажмите, чтобы открыть другую';
-  document.title = 'Video Manager' + (ROOT ? ' — ' + ROOT : '');
+  b.textContent = 'Folder: ' + (ROOT || '—') + ' ▾';
+  b.title = 'Current folder: ' + ROOT_PATH + '. Click to open another one';
+  document.title = 'VSPO' + (ROOT ? ' — ' + ROOT : '');
 }
 $('#rootb').onclick = () => {
   const p = $('#rootp');
@@ -3668,24 +3673,24 @@ $('#rootb').onclick = () => {
   if (p.hidden) return;
   $('#trashp').hidden = true;
   $('#rooti').textContent = ROOT_PATH;
-  $('#rootl').innerHTML = recent.map((r, i) => '<button data-i="' + i + '" title="Открыть эту папку">' + esc(r.name) +
+  $('#rootl').innerHTML = recent.map((r, i) => '<button data-i="' + i + '" title="Open this folder">' + esc(r.name) +
     '<span class="dim">' + esc(r.folder) + '</span></button>').join('');
   $('#rootl').hidden = !recent.length;
 };
 $('#rcancel').onclick = () => { $('#rootp').hidden = true; };
 async function openRoot(path, body) {
-  if (job.running) { toast('Идёт создание превью: дождитесь конца или остановите его', true); return; }
+  if (job.running) { toast('Previews are being created: wait until it finishes or stop it', true); return; }
   $('#rootp').hidden = true;
-  if (undoN && !await ask('В другой папке Ctrl+Z не вернёт то, что удалено здесь (файлы останутся в _на_удаление этой папки). Открыть другую папку?', 'Открыть')) return;
+  if (undoN && !await ask('In another folder Ctrl+Z cannot restore what was deleted here (the files stay in this folder\'s _to_delete). Open another folder?', 'Open')) return;
   $('#rootb').disabled = true;
-  toast(body ? 'Читаю папку…' : 'Выберите папку в окне выбора…');
+  toast(body ? 'Reading the folder…' : 'Choose a folder in the dialog…');
   try {
     await store.flush();
     const r = await api(path, true, body);
     if (r.ok) { location.reload(); return; }  // настройки страницы свои у каждой папки: проще загрузить её заново
-    toast('Папка не выбрана');
+    toast('No folder chosen');
   } catch (e) {
-    toast('Не открыто: ' + e.message, true);
+    toast('Not opened: ' + e.message, true);
   }
   $('#rootb').disabled = false;
 }
@@ -3701,13 +3706,13 @@ $('#trash').onclick = () => {
   if (!p.hidden) $('#rootp').hidden = true;
   if (!p.hidden) {
     const n = trashInfo.files;
-    $('#trashi').textContent = 'В папке _на_удаление: ' + n + ' ' + plural(n, ['файл', 'файла', 'файлов']) + ', ' +
-      fmtSize(trashInfo.bytes) + '. После удаления насовсем вернуть их будет нельзя, Ctrl+Z тоже перестанет работать.';
+    $('#trashi').textContent = 'In _to_delete: ' + n + ' ' + plural(n, ['file', 'files']) + ', ' +
+      fmtSize(trashInfo.bytes) + '. Once deleted permanently they cannot be restored, and Ctrl+Z stops working too.';
   }
 };
 $('#tcancel').onclick = () => { $('#trashp').hidden = true; };
 $('#topen').onclick = () => {
-  api('/api/trash/open', true).catch(e => toast('Не открыто: ' + e.message, true));
+  api('/api/trash/open', true).catch(e => toast('Not opened: ' + e.message, true));
 };
 $('#tpurge').onclick = async () => {
   const b = $('#tpurge');
@@ -3720,10 +3725,10 @@ $('#tpurge').onclick = async () => {
     trashStat();
     $('#trashp').hidden = true;
     const bad = r.failed.length;
-    toast('Удалено насовсем: ' + r.removed + ' ' + plural(r.removed, ['файл', 'файла', 'файлов']) + ', освобождено ' +
-      fmtSize(r.bytes) + (bad ? '. Не удалось удалить: ' + bad + ' (' + r.failed[0].error + ')' : ''), bad > 0);
+    toast('Deleted permanently: ' + r.removed + ' ' + plural(r.removed, ['file', 'files']) + ', freed ' +
+      fmtSize(r.bytes) + (bad ? '. Could not delete: ' + bad + ' (' + r.failed[0].error + ')' : ''), bad > 0);
   } catch (e) {
-    toast('Не очищено: ' + e.message, true);
+    toast('Not emptied: ' + e.message, true);
   }
   b.disabled = false;
 };
@@ -3735,20 +3740,20 @@ async function rescan() {
   refreshing = true;
   const b = $('#refresh');
   b.disabled = true;
-  b.textContent = 'Обновляю…';
+  b.textContent = 'Refreshing…';
   try {
     const r = await api('/api/rescan', true);
     await load();
     const add = [];
-    if (r.added_videos) add.push(r.added_videos + ' ' + plural(r.added_videos, ['новое видео', 'новых видео', 'новых видео']));
-    if (r.added_previews) add.push(r.added_previews + ' ' + plural(r.added_previews, ['новое превью', 'новых превью', 'новых превью']));
-    if (r.gone) add.push('пропало файлов: ' + r.gone);
-    toast(add.length ? 'Обновлено: ' + add.join(', ') : 'Обновлено: изменений нет');
+    if (r.added_videos) add.push(r.added_videos + ' new ' + plural(r.added_videos, ['video', 'videos']));
+    if (r.added_previews) add.push(r.added_previews + ' new ' + plural(r.added_previews, ['preview', 'previews']));
+    if (r.gone) add.push('files gone: ' + r.gone);
+    toast(add.length ? 'Refreshed: ' + add.join(', ') : 'Refreshed: no changes');
   } catch (e) {
-    toast('Не обновлено: ' + e.message, true);
+    toast('Not refreshed: ' + e.message, true);
   }
   b.disabled = false;
-  b.textContent = 'Обновить';
+  b.textContent = 'Refresh';
   refreshing = false;
 }
 $('#refresh').onclick = rescan;
@@ -3758,8 +3763,8 @@ $('#refresh').onclick = rescan;
 $('#orph').onclick = async () => {
   const list = items.filter(i => !i.nv);
   if (!list.length) return;
-  const where = folder ? 'в папке «' + folder + '»' + (deep ? ' и подпапках' : '') : 'во всех папках';
-  const yes = await ask('Убрать превью без видео ' + where + ': ' + list.length + ' шт.?\n\nФайлы переедут в _на_удаление, видео не затрагиваются.\nCtrl+Z вернёт их все сразу.', 'Убрать');
+  const where = folder ? 'in "' + folder + '"' + (deep ? ' and its subfolders' : '') : 'in all folders';
+  const yes = await ask('Remove ' + list.length + ' ' + plural(list.length, ['preview', 'previews']) + ' without video ' + where + '?\n\nThe files will be moved to _to_delete, videos are not touched.\nCtrl+Z brings them all back.', 'Remove');
   if (!yes) return;
   $('#orph').disabled = true;
   try {
@@ -3767,10 +3772,10 @@ $('#orph').onclick = async () => {
     trashInfo = r.trash;
     await load();
     const bad = r.failed.length;
-    toast('Перенесено в _на_удаление: ' + r.removed + ' ' + plural(r.removed, ['превью', 'превью', 'превью']) +
-      (bad ? '. Не удалось: ' + bad + ' (' + r.failed[0].error + ')' : '. Ctrl+Z вернёт их'), bad > 0);
+    toast('Moved to _to_delete: ' + r.removed + ' ' + plural(r.removed, ['preview', 'previews']) +
+      (bad ? '. Failed: ' + bad + ' (' + r.failed[0].error + ')' : '. Ctrl+Z brings them back'), bad > 0);
   } catch (e) {
-    toast('Не убрано: ' + e.message, true);
+    toast('Not removed: ' + e.message, true);
   }
   $('#orph').disabled = false;
 };
@@ -3781,7 +3786,7 @@ function ask(text, okLabel) {
   return new Promise(res => {
     const d = $('#dlg');
     $('#dtxt').textContent = text;
-    $('#dok').textContent = okLabel || 'Продолжить';
+    $('#dok').textContent = okLabel || 'Continue';
     d.hidden = false;
     $('#dok').focus();
     const done = v => { d.hidden = true; ask.cancel = null; res(v); };
@@ -3797,33 +3802,33 @@ const videoCount = () => all.filter(inView).reduce((s, i) => s + i.nv, 0) + vide
 function folderStat() {
   $('#fdel').disabled = !folder;
   const n = videoCount(), name = mpc.name || 'MPC';
-  const tip = mpc.ok ? '' : 'MPC не найден: укажите путь параметром --player или в pairview.json';
+  const tip = mpc.ok ? '' : 'MPC not found: set its path with --player or in pairview.json';
   const p = $('#fplay'), b = $('#fmpc');
-  p.textContent = 'Воспроизвести в ' + name + ' (' + n + ')';
+  p.textContent = 'Play in ' + name + ' (' + n + ')';
   p.disabled = b.disabled = !n;
-  p.title = tip || 'Запустить все видео выбранной папки' + (deep ? ' и подпапок' : '') + ' в ' + name +
-    ': плейлист заменится и воспроизведение начнётся сразу (как «Play with MPC-HC» в проводнике)';
-  b.title = tip || 'Дописать видео в конец плейлиста ' + name + ', не запуская воспроизведение (как «Add to playlist»)';
+  p.title = tip || 'Play all videos of the selected folder' + (deep ? ' and its subfolders' : '') + ' in ' + name +
+    ': the playlist is replaced and playback starts at once (like "Play with MPC-HC" in Explorer)';
+  b.title = tip || 'Append the videos to the ' + name + ' playlist without starting playback (like "Add to playlist")';
 }
 async function mpcSend(body, add) {
   try {
     const r = await api('/api/mpc', true, Object.assign({add}, body));
-    toast((add ? 'В плейлист ' + mpc.name + ' добавлено видео: ' : 'Запускаю в ' + mpc.name + ', видео: ') + r.added +
-      (r.calls > 1 ? ' (несколькими запросами: длинный список)' : ''));
+    toast((add ? 'Added to the ' + mpc.name + ' playlist: ' : 'Playing in ' + mpc.name + ', videos: ') + r.added +
+      (r.calls > 1 ? ' (in several calls: long list)' : ''));
   } catch (e) {
-    toast('Не получилось: ' + e.message, true);
+    toast('Failed: ' + e.message, true);
   }
   folderStat();
 }
 $('#fplay').onclick = () => mpcSend({dir: folder, deep}, false);
 $('#fmpc').onclick = () => mpcSend({dir: folder, deep}, true);
 $('#fexp').onclick = () => {
-  api('/api/explorer', true, {dir: folder}).catch(e => toast('Не открыто: ' + e.message, true));
+  api('/api/explorer', true, {dir: folder}).catch(e => toast('Not opened: ' + e.message, true));
 };
 function showCur() {
   const it = items[cur];
   if (!it) return;
-  api('/api/explorer', true, {id: it.id}).catch(e => toast('Не открыто: ' + e.message, true));
+  api('/api/explorer', true, {id: it.id}).catch(e => toast('Not opened: ' + e.message, true));
 }
 addEventListener('contextmenu', e => { if (window.pywebview) e.preventDefault(); });
 
@@ -3834,13 +3839,13 @@ function pickStat() {
   document.body.classList.toggle('picking', picked.size > 0);
   const sel = items.filter(i => picked.has(i.id)), n = sel.length, withVideo = sel.filter(i => i.nv).length;
   $('#selbar').hidden = !n;
-  $('#selcnt').textContent = 'Выбрано: ' + n;
-  $('#sdel').textContent = 'Удалить пары (' + n + ')';
-  $('#sredo').textContent = 'Пересоздать превью (' + withVideo + ')';
+  $('#selcnt').textContent = 'Selected: ' + n;
+  $('#sdel').textContent = 'Delete (' + n + ')';
+  $('#sredo').textContent = 'Recreate previews (' + withVideo + ')';
   $('#sredo').disabled = !withVideo || job.running || !ff.ok;
-  $('#splay').textContent = 'Воспроизвести в MPC (' + withVideo + ')';
+  $('#splay').textContent = 'Play in MPC (' + withVideo + ')';
   $('#splay').disabled = !withVideo;
-  if (viewer && items[cur]) $('#vpk').textContent = picked.has(items[cur].id) ? '✓ Выбрано' : 'Выбрать (X)';
+  if (viewer && items[cur]) $('#vpk').textContent = picked.has(items[cur].id) ? '✓ Selected' : 'Select (X)';
 }
 
 function togglePick(i, range) {
@@ -3868,10 +3873,10 @@ async function deleteSelected() {
     await load();
     select(Math.min(at, items.length - 1));
     const bad = r.failed.length;
-    toast('Перенесено в _на_удаление: ' + r.removed + ' ' + plural(r.removed, ['пара', 'пары', 'пар']) +
-      (bad ? '. Не удалось: ' + bad + ' (' + r.failed[0].error + ')' : '. Ctrl+Z вернёт их все сразу'), bad > 0);
+    toast('Moved to _to_delete: ' + r.removed + ' ' + plural(r.removed, ['item', 'items']) +
+      (bad ? '. Failed: ' + bad + ' (' + r.failed[0].error + ')' : '. Ctrl+Z brings them all back'), bad > 0);
   } catch (e) {
-    toast('Не удалено: ' + e.message, true);
+    toast('Not deleted: ' + e.message, true);
   }
   busy = false;
   pickStat();
@@ -3883,9 +3888,9 @@ $('#snone').onclick = () => { picked.clear(); pickStat(); };
 $('#sredo').onclick = async () => {
   const ids = items.filter(i => picked.has(i.id) && i.nv).map(i => i.id);
   if (!ids.length || job.running) return;
-  const yes = await ask('Пересоздать превью выбранных: ' + ids.length + ' шт.?\n\nФормат: сетка ' + opts.cols + '×' + opts.rows + ', ' +
-    opts.width + ' px, ' + (opts.header ? 'с заголовком' : 'только таймкоды') +
-    '.\nСтарые превью будут перенесены в _на_удаление, видео не затрагиваются.', 'Пересоздать');
+  const yes = await ask('Recreate the previews of ' + ids.length + ' selected ' + plural(ids.length, ['video', 'videos']) + '?\n\nFormat: ' + opts.cols + '×' + opts.rows + ' grid, ' +
+    opts.width + ' px, ' + (opts.header ? 'with header' : 'timestamps only') +
+    '.\nOld previews will be moved to _to_delete, videos are not touched.', 'Recreate');
   if (yes) { picked.clear(); pickStat(); startMake(ids, true); }
 };
 $('#splay').onclick = () => {
@@ -3907,26 +3912,26 @@ $('#fdel').onclick = async () => {
   try {
     info = await api('/api/folder/info', true, {dir: target});
   } catch (e) {
-    toast('Папку не удалось осмотреть: ' + e.message, true);
+    toast('Could not inspect the folder: ' + e.message, true);
     return;
   }
   const parts = [];
-  if (info.pairs) parts.push(info.pairs + ' ' + plural(info.pairs, ['пара', 'пары', 'пар']));
-  if (info.videos_only) parts.push(info.videos_only + ' видео без превью');
-  if (info.previews_only) parts.push(info.previews_only + ' превью без видео');
-  if (info.other) parts.push(info.other + ' ' + plural(info.other, ['другой файл', 'других файла', 'других файлов']));
-  const yes = await ask('Удалить папку «' + target + '» целиком?\n\nВнутри: ' + (parts.join(', ') || 'файлов нет') +
-    '; подпапок: ' + info.dirs + '. Всего ' + fmtSize(info.bytes) + '.\n\nПапка переедет в _на_удаление вместе с подпапками ' +
-    'и всеми файлами (галочка «включая подпапки» не влияет). Ctrl+Z вернёт её.', 'Удалить папку');
+  if (info.pairs) parts.push(info.pairs + ' ' + plural(info.pairs, ['video', 'videos']) + ' with previews');
+  if (info.videos_only) parts.push(info.videos_only + ' ' + plural(info.videos_only, ['video', 'videos']) + ' without previews');
+  if (info.previews_only) parts.push(info.previews_only + ' ' + plural(info.previews_only, ['preview', 'previews']) + ' without video');
+  if (info.other) parts.push(info.other + ' other ' + plural(info.other, ['file', 'files']));
+  const yes = await ask('Delete the folder "' + target + '" with everything in it?\n\nInside: ' + (parts.join(', ') || 'no files') +
+    '; subfolders: ' + info.dirs + '. Total ' + fmtSize(info.bytes) + '.\n\nThe folder will be moved to _to_delete with its subfolders ' +
+    'and all files (the "include subfolders" checkbox does not matter). Ctrl+Z brings it back.', 'Delete folder');
   if (!yes) return;
   try {
     const r = await api('/api/folder/delete', true, {dir: target});
     trashInfo = r.trash;
     forgetDir(target);
     await load();
-    toast('Папка «' + target + '» перенесена в _на_удаление. Ctrl+Z вернёт её');
+    toast('Folder "' + target + '" moved to _to_delete. Ctrl+Z brings it back');
   } catch (e) {
-    toast('Не удалено: ' + e.message, true);
+    toast('Not deleted: ' + e.message, true);
   }
 };
 
@@ -3935,13 +3940,13 @@ $('#fempty').onclick = async () => {
   try {
     r = await api('/api/empty', true, {});
   } catch (e) {
-    toast('Не удалось найти пустые папки: ' + e.message, true);
+    toast('Could not look for empty folders: ' + e.message, true);
     return;
   }
-  if (!r.dirs.length) { toast('Пустых папок нет'); return; }
-  const shown = r.dirs.slice(0, 25).map(d => '• ' + d).join('\n') + (r.dirs.length > 25 ? '\n… и ещё ' + (r.dirs.length - 25) : '');
-  const yes = await ask('Пустые папки (без файлов): ' + r.dirs.length + ' шт.\n\n' + shown +
-    '\n\nОни переедут в _на_удаление. Ctrl+Z вернёт их.', 'Убрать ' + r.dirs.length);
+  if (!r.dirs.length) { toast('No empty folders'); return; }
+  const shown = r.dirs.slice(0, 25).map(d => '• ' + d).join('\n') + (r.dirs.length > 25 ? '\n… and ' + (r.dirs.length - 25) + ' more' : '');
+  const yes = await ask('Empty folders (no files): ' + r.dirs.length + '\n\n' + shown +
+    '\n\nThey will be moved to _to_delete. Ctrl+Z brings them back.', 'Remove ' + r.dirs.length);
   if (!yes) return;
   try {
     const d = await api('/api/empty/delete', true, {dirs: r.dirs});
@@ -3949,9 +3954,9 @@ $('#fempty').onclick = async () => {
     r.dirs.forEach(forgetDir);
     await load();
     const bad = d.failed.length;
-    toast('Пустых папок перенесено: ' + d.removed + (bad ? '. Не удалось: ' + bad + ' (' + d.failed[0].error + ')' : '. Ctrl+Z вернёт их'), bad > 0);
+    toast('Empty folders moved: ' + d.removed + (bad ? '. Failed: ' + bad + ' (' + d.failed[0].error + ')' : '. Ctrl+Z brings them back'), bad > 0);
   } catch (e) {
-    toast('Не убрано: ' + e.message, true);
+    toast('Not removed: ' + e.message, true);
   }
 };
 
@@ -3970,7 +3975,7 @@ def die(msg):
     if os.name == 'nt' and not HAS_CONSOLE[0]:
         try:
             import ctypes
-            ctypes.windll.user32.MessageBoxW(0, str(msg), 'pairview', 0x10)
+            ctypes.windll.user32.MessageBoxW(0, str(msg), APP, 0x10)
         except Exception:  # noqa: BLE001
             pass
     sys.exit(1)
@@ -3988,7 +3993,7 @@ def setup_log():
             os.remove(path)
         log = open(path, 'a', encoding='utf-8', buffering=1)
         sys.stdout = sys.stderr = log
-        print('\n=== запуск %s ===' % time.strftime('%Y-%m-%d %H:%M:%S'))
+        print('\n=== start %s ===' % time.strftime('%Y-%m-%d %H:%M:%S'))
     except OSError:
         pass
 
@@ -4003,9 +4008,9 @@ def load_config():
                     cfg = json.load(f)
                 if isinstance(cfg, dict):
                     return cfg, path
-                print('Файл %s: ожидался объект {"параметр": значение}, пропущен.' % path)
+                print('File %s: expected an object {"option": value}, skipped.' % path)
             except (OSError, ValueError) as e:
-                print('Файл %s не прочитан: %s' % (path, e))
+                print('Could not read %s: %s' % (path, e))
     return {}, ''
 
 
@@ -4018,7 +4023,7 @@ def pick_folder(initial=''):
         root.withdraw()
         root.attributes('-topmost', True)
         try:
-            return filedialog.askdirectory(title='Папка с видео и превью', initialdir=initial or None, mustexist=True) or ''
+            return filedialog.askdirectory(title='Folder with videos and previews', initialdir=initial or None, mustexist=True) or ''
         finally:
             root.destroy()
     except Exception:  # noqa: BLE001 — нет tkinter или дисплея
@@ -4028,44 +4033,45 @@ def pick_folder(initial=''):
 def main():
     global ROOT_NAME, VROOT, PROOT
     setup_log()
-    ap = argparse.ArgumentParser(description='Video Manager: просмотр превью, выборочное удаление, создание превью, запуск в MPC.')
+    ap = argparse.ArgumentParser(description=APP + ' (Video Streams Preview Organizer): browse previews, delete videos, '
+                                             'create previews, play in MPC.')
     ap.add_argument('folder', nargs='?',
-                    help='папка с видео (и с превью, если они лежат вместе); подпапки учитываются. '
-                         'Без неё открывается папка прошлого запуска, если её нет — folder из pairview.json, '
-                         'иначе диалог выбора папки')
-    ap.add_argument('--previews', metavar='ПАПКА', help='отдельная папка с превью (подпапки те же, что у видео)')
+                    help='folder with videos (and previews, if they are stored together); subfolders are included. '
+                         'Without it the folder from the last run opens, otherwise "folder" from pairview.json, '
+                         'otherwise a folder picker')
+    ap.add_argument('--previews', metavar='FOLDER', help='separate folder with previews (same subfolders as the videos)')
     ap.add_argument('--clean', choices=['videos', 'previews'],
-                    help='videos — файлы видео без превью; previews — превью без видео')
-    ap.add_argument('--apply', action='store_true', help='с --clean: реально перенести в %s' % TRASH)
-    ap.add_argument('--purge', action='store_true', help='удалить насовсем всё, что лежит в %s' % TRASH)
-    ap.add_argument('--ffmpeg', metavar='ПУТЬ', help='путь к ffmpeg (файлу или папке), если его нет в PATH')
-    ap.add_argument('--font', metavar='ПУТЬ', help='файл шрифта .ttf для подписей на превью')
-    ap.add_argument('--player', metavar='ПУТЬ',
-                    help='путь к mpc-hc64.exe / mpc-be64.exe для кнопки «В плейлист MPC» '
-                         '(по умолчанию ищется MPC-HC из K-Lite и в стандартных папках)')
-    ap.add_argument('--cols', type=int, default=10, help='столбцов кадров в превью (по умолчанию 10)')
-    ap.add_argument('--rows', type=int, default=9, help='строк кадров в превью (по умолчанию 9)')
-    ap.add_argument('--width', type=int, default=2560, help='ширина превью в пикселях (по умолчанию 2560, под 2K-монитор)')
-    ap.add_argument('--header', action='store_true', help='добавить сверху заголовок с данными о файле (по умолчанию только таймкоды)')
+                    help='videos — videos without previews; previews — previews without videos')
+    ap.add_argument('--apply', action='store_true', help='with --clean: actually move the files to %s' % TRASH)
+    ap.add_argument('--purge', action='store_true', help='permanently delete everything in %s' % TRASH)
+    ap.add_argument('--ffmpeg', metavar='PATH', help='path to ffmpeg (file or folder) if it is not in PATH')
+    ap.add_argument('--font', metavar='PATH', help='.ttf font file for the timestamps on previews')
+    ap.add_argument('--player', metavar='PATH',
+                    help='path to mpc-hc64.exe / mpc-be64.exe for the MPC buttons '
+                         '(by default MPC-HC from K-Lite and standard folders are searched)')
+    ap.add_argument('--cols', type=int, default=10, help='frame columns in a preview (default 10)')
+    ap.add_argument('--rows', type=int, default=9, help='frame rows in a preview (default 9)')
+    ap.add_argument('--width', type=int, default=2560, help='preview width in pixels (default 2560, for a 2K monitor)')
+    ap.add_argument('--header', action='store_true', help='add a header with file details on top (default: timestamps only)')
     ap.add_argument('--gpu', choices=['auto', 'on', 'off'], default='auto',
-                    help='видеокарта NVIDIA: on — декодировать на ней (для превью обычно не ускоряет: время уходит на запуск ffmpeg и чтение диска), auto и off — процессор')
+                    help='NVIDIA GPU: on — decode on it (usually no faster for previews: the time goes into starting ffmpeg and reading the disk), auto and off — CPU')
     ap.add_argument('--jobs', type=int, default=OPTS['jobs'],
-                    help='сколько видео обрабатывать одновременно (по умолчанию %d: половина ядер процессора)' % OPTS['jobs'])
-    ap.add_argument('--ignore-ext', default='ts', metavar='СПИСОК',
-                    help='расширения видео, которые игнорировать, через запятую (по умолчанию ts); '
-                         'пустая строка — ничего не игнорировать')
+                    help='how many videos to process at once (default %d: half of the CPU cores)' % OPTS['jobs'])
+    ap.add_argument('--ignore-ext', default='ts', metavar='LIST',
+                    help='comma-separated video extensions to ignore (default ts); '
+                         'an empty string ignores nothing')
     ap.add_argument('--per-frame', action='store_true',
-                    help='брать кадры превью по одному, а не пачками (медленнее; на случай, если пачки не работают)')
+                    help='take preview frames one by one instead of in batches (slower; in case batches do not work)')
     ap.add_argument('--port', type=int, default=0,
-                    help='порт локального сервера (по умолчанию выбирается свободный: окна на разных папках не мешают друг другу)')
-    ap.add_argument('--browser', action='store_true', help='открыть галерею в браузере, а не в своём окне (pywebview)')
-    ap.add_argument('--no-browser', action='store_true', help='ничего не открывать (только сервер)')
+                    help='local server port (default: any free port, so windows for different folders do not interfere)')
+    ap.add_argument('--browser', action='store_true', help='open the gallery in the browser instead of the app window (pywebview)')
+    ap.add_argument('--no-browser', action='store_true', help='open nothing (server only)')
 
     cfg, cfg_path = load_config()
     known = {x.dest for x in ap._actions}
     unknown = sorted(k for k in cfg if k not in known)
     if unknown:
-        print('В %s неизвестные параметры (пропущены): %s' % (cfg_path, ', '.join(unknown)))
+        print('Unknown options in %s (skipped): %s' % (cfg_path, ', '.join(unknown)))
     cfg_folder = cfg.pop('folder', None)  # папка из файла — запасная: важнее папка прошлого запуска
     ap.set_defaults(**{k: v for k, v in cfg.items() if k in known})
     a = ap.parse_args()
@@ -4077,18 +4083,18 @@ def main():
             # previews из pairview.json относится к папке из файла; у папки прошлого запуска — своя
             if not any(x == '--previews' or x.startswith('--previews=') for x in sys.argv[1:]):
                 a.previews = last_p or None
-            print('Папка прошлого запуска: ' + last)
+            print('Folder from the last run: ' + last)
         elif isinstance(cfg_folder, str) and cfg_folder:
             a.folder = cfg_folder
         else:
             a.folder = pick_folder()
         if not a.folder:
-            die('Не указана папка. Запустите: pairview.py "D:\\Видео" — или впишите "folder" в pairview.json.')
+            die('No folder given. Run: pairview.py "D:\\Videos" — or put "folder" into pairview.json.')
     vroot = os.path.abspath(a.folder)
     proot = os.path.abspath(a.previews) if a.previews else vroot
     for r in (vroot, proot):
         if not os.path.isdir(r):
-            die('Нет такой папки: ' + r)
+            die('No such folder: ' + r)
     VROOT, PROOT = vroot, proot
     ROOT_NAME = os.path.basename(vroot) or vroot
     remember_folder(vroot, proot)
@@ -4097,16 +4103,16 @@ def main():
         refresh_trash_stats(wait=True)
         st = trash_stats()
         if not st['files']:
-            print('В %s пусто.' % TRASH)
+            print('%s is empty.' % TRASH)
             return
-        print('В %s: файлов %d, всего %s.' % (' и '.join(trash_dirs()), st['files'], human_size(st['bytes'])))
-        if input('Удалить насовсем? Вернуть их будет нельзя. [д/Н] ').strip().lower() not in ('д', 'да', 'y', 'yes'):
-            print('Отменено.')
+        print('In %s: %d files, %s in total.' % (' and '.join(d for d in trash_dirs() if os.path.isdir(d)), st['files'], human_size(st['bytes'])))
+        if input('Delete permanently? They cannot be restored. [y/N] ').strip().lower() not in ('y', 'yes', 'д', 'да'):
+            print('Cancelled.')
             return
         r = purge()
-        print('Удалено файлов: %d, освобождено %s.' % (r['removed'], human_size(r['bytes'])))
+        print('Deleted files: %d, freed %s.' % (r['removed'], human_size(r['bytes'])))
         for f in r['failed'][:20]:
-            print('  не удалось:', f['path'], '—', f['error'])
+            print('  failed:', f['path'], '—', f['error'])
         return
 
     OPTS.update(cols=max(1, min(a.cols, 20)), rows=max(1, min(a.rows, 20)), header=a.header,
@@ -4116,11 +4122,11 @@ def main():
     detect_ff(a.ffmpeg, a.font)
     PLAYER['path'] = find_player(a.player)
     if a.player and not PLAYER['path']:
-        print('Предупреждение: плеер из --player не найден: %s' % a.player)
+        print('Warning: the player from --player was not found: %s' % a.player)
     wanted = {'.' + x.strip().lstrip('.').lower()
               for x in a.ignore_ext.replace(';', ',').replace(' ', ',').split(',') if x.strip().strip('.')}
     if wanted - VIDEO:
-        print('Предупреждение: %s и так не считаются видео, игнорировать нечего.' % ', '.join(sorted(wanted - VIDEO)))
+        print('Warning: %s are not video extensions anyway, nothing to ignore.' % ', '.join(sorted(wanted - VIDEO)))
     IGNORE.clear()
     IGNORE.update(wanted & VIDEO)
 
@@ -4128,46 +4134,46 @@ def main():
     pairs = sum(1 for g in groups.values() if g['v'] and g['p'])
     only_p = sum(1 for g in groups.values() if g['p'] and not g['v'])
     only_v = sum(1 for g in groups.values() if g['v'] and not g['p'])
-    print('Пар: %d, превью без видео: %d, видео без превью: %d' % (pairs, only_p, only_v))
+    print('Videos with previews: %d, previews without video: %d, videos without preview: %d' % (pairs, only_p, only_v))
     if IGNORE:
-        print('Игнорируются файлы %s: пропущено %d (параметр --ignore-ext)' % (', '.join(sorted(IGNORE)), SCAN['ignored']))
+        print('Ignoring %s files: %d skipped (option --ignore-ext)' % (', '.join(sorted(IGNORE)), SCAN['ignored']))
     if not groups:
-        msg = ('Ни видео, ни превью не найдено в %s: проверьте путь к папке.' % vroot +
-               (' Все найденные видеофайлы (%d) игнорируются из-за --ignore-ext.' % SCAN['ignored'] if SCAN['ignored'] else ''))
+        msg = ('No videos or previews found in %s: check the folder path.' % vroot +
+               (' All video files found (%d) are ignored because of --ignore-ext.' % SCAN['ignored'] if SCAN['ignored'] else ''))
         if a.clean:
             die(msg)
-        print(msg + ' Другую папку можно открыть кнопкой в шапке.')  # не выходим: пустая папка прошлого запуска иначе не даст запуститься
+        print(msg + ' Another folder can be opened with the button in the header.')  # не выходим: пустая папка прошлого запуска иначе не даст запуститься
 
     if a.clean:
         if not pairs:
-            die('Ни одной пары не найдено: проверьте имена файлов и (при --previews) одинаковые подпапки.')
+            die('No video has a preview: check the file names and (with --previews) that the subfolders match.')
         src, other = ('v', 'p') if a.clean == 'videos' else ('p', 'v')
         files = [f for g in groups.values() if g[src] and not g[other] for f in g[src]]
-        print('Без пары (%s): %d' % ('видео' if src == 'v' else 'превью', len(files)))
+        print('%s: %d' % ('Videos without preview' if src == 'v' else 'Previews without video', len(files)))
         for f in files[:20]:
             print('  ', f[0])
         if len(files) > 20:
-            print('   … и ещё', len(files) - 20)
+            print('   … and', len(files) - 20, 'more')
         if not files:
             return
         if not a.apply:
-            print('Пробный запуск, ничего не перенесено. Для переноса добавьте --apply.')
+            print('Dry run, nothing was moved. Add --apply to move the files.')
             return
-        if input('Перенести %d файл(ов) в %s? [д/Н] ' % (len(files), TRASH)).strip().lower() not in ('д', 'да', 'y', 'yes'):
-            print('Отменено.')
+        if input('Move %d file(s) to %s? [y/N] ' % (len(files), TRASH)).strip().lower() not in ('y', 'yes', 'д', 'да'):
+            print('Cancelled.')
             return
         for f in files:
             to_trash(f[0], f[1])
-        print('Готово.')
+        print('Done.')
         return
 
     if FF['ok']:
-        print('ffmpeg: %s%s' % (FF['version'] or 'найден', '' if FF['drawtext'] and FF['font']
-                                else ' (без подписей на кадрах: нет drawtext или шрифта, см. --font)'))
-        print('Декодирование видео: ' + gpu_info())
+        print('ffmpeg: %s%s' % (FF['version'] or 'found', '' if FF['drawtext'] and FF['font']
+                                else ' (no timestamps on frames: drawtext or a font is missing, see --font)'))
+        print('Video decoding: ' + gpu_info())
     else:
-        print('ffmpeg не найден — создание превью недоступно (подсказка есть в интерфейсе).')
-    print('Плеер для плейлиста: ' + (PLAYER['path'] or 'MPC не найден (кнопка «В плейлист MPC» не заработает; см. --player)'))
+        print('ffmpeg not found — preview creation is unavailable (see the hint in the interface).')
+    print('Player: ' + (PLAYER['path'] or 'MPC not found (the MPC buttons will not work; see --player)'))
     for gid, key in enumerate(sorted(groups)):
         GROUPS[gid] = groups[key]
     IDS['next'] = len(groups)
@@ -4177,22 +4183,22 @@ def main():
     except OSError:
         srv = Server(('127.0.0.1', 0), Handler)
     url = 'http://127.0.0.1:%d/?t=%s' % (srv.server_address[1], TOKEN)
-    print('Галерея:', url)
-    print('«Удалить пару» переносит файлы в', TRASH)
+    print('Gallery:', url)
+    print('"Delete" moves files to', TRASH)
     try:
         if a.no_browser:
-            print('Выход — Ctrl+C.')
+            print('Press Ctrl+C to quit.')
             srv.serve_forever()
         elif a.browser:
-            print('Выход — Ctrl+C.')
+            print('Press Ctrl+C to quit.')
             webbrowser.open(url)
             srv.serve_forever()
         else:
             threading.Thread(target=srv.serve_forever, daemon=True).start()
-            if run_window(url, 'Video Manager — ' + ROOT_NAME):
-                print('Окно закрыто.')
+            if run_window(url, APP + ' — ' + ROOT_NAME):
+                print('Window closed.')
             else:
-                print('Выход — Ctrl+C.')
+                print('Press Ctrl+C to quit.')
                 webbrowser.open(url)
                 while True:
                     time.sleep(3600)
