@@ -197,7 +197,7 @@ pythonw.exe pairview.py "D:\Видео"     # без консоли (ярлык)
 
 Сборку делает GitHub Actions (`.github/workflows/build.yml`): при каждом push (и вручную — Run workflow) на `windows-latest`
 с Python 3.12 собирается `VSPO.exe` и выкладывается артефактом «VSPO» на странице запуска. Тег `v*` (например `v1.0`) дополнительно
-прикладывает exe к релизу. Вручную на Windows:
+прикладывает exe к релизу; то же — ручной запуск с тегом в поле release (тег создаёт сам GitHub). Вручную на Windows:
 
 ```
 pip install pyinstaller pywebview

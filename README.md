@@ -66,7 +66,7 @@ Persistent options can be put into `pairview.json` next to the program or in `%A
 
 ## Building a standalone exe
 
-GitHub Actions builds `VSPO.exe` on every push (workflow **Build exe**, also runnable by hand): download it from the run's **Artifacts**. Pushing a tag like `v1.0` also attaches the exe to a GitHub release. To build locally on Windows:
+GitHub Actions builds `VSPO.exe` on every push (workflow **Build exe**, also runnable by hand): download it from the run's **Artifacts**. Pushing a tag like `v1.0`, or running the workflow by hand with a tag in the **release** field, also publishes the exe as a GitHub release. To build locally on Windows:
 
 ```bat
 pip install pyinstaller pywebview
