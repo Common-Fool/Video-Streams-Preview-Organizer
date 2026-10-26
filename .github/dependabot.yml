@@ -1,0 +1,10 @@
+version: 2
+updates:
+  # у самой программы внешних зависимостей нет; следим только за версиями действий в сборке
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ['*']

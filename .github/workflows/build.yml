@@ -12,7 +12,7 @@ on:
         default: ''
 
 permissions:
-  contents: write  # для выкладки сборок в релиз по тегу v*
+  contents: read  # сборкам хватает чтения; запись — только у этапа release
 
 jobs:
   windows:
@@ -94,7 +94,8 @@ jobs:
           printf '[Desktop Entry]\nType=Application\nName=VSPO\nComment=Video Streams Preview Organizer\nExec=VSPO\nIcon=vspo\nCategories=AudioVideo;Video;\nTerminal=false\n' > AppDir/vspo.desktop
           cp assets/vspo.png AppDir/vspo.png
           cp assets/vspo.png AppDir/.DirIcon
-          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          wget -q https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool-x86_64.AppImage" | sha256sum -c -
           chmod +x appimagetool-x86_64.AppImage
           ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run AppDir VSPO-x86_64.AppImage
 
@@ -107,14 +108,31 @@ jobs:
     needs: [windows, macos, linux]
     if: startsWith(github.ref, 'refs/tags/v') || inputs.release != ''
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # создать релиз и выложить в него сборки
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # вся история и теги: для списка изменений с прошлого релиза
 
       - name: Check that the release tag matches VERSION
+        env:
+          tag: ${{ inputs.release || github.ref_name }}
         run: |
-          tag='${{ inputs.release || github.ref_name }}'
           ver=$(python3 -c "import re; print(re.search(r\"^VERSION = '([^']+)'\", open('pairview.py', encoding='utf-8').read(), re.M).group(1))")
           if [ "$tag" != "v$ver" ]; then echo "Tag $tag does not match VERSION = '$ver' in pairview.py"; exit 1; fi
+
+      - name: Release notes from commits since the previous tag
+        # в main пушат напрямую, без PR: автоматический текст GitHub из PR был бы пустым
+        env:
+          tag: ${{ inputs.release || github.ref_name }}
+        run: |
+          prev=$(git tag --list 'v*' --sort=-v:refname | grep -vx "$tag" | head -1)
+          {
+            echo "## Changes"
+            git log --no-merges --format='- %s' ${prev:+$prev..}HEAD
+          } > notes.md
+          cat notes.md
 
       - uses: actions/download-artifact@v4
         with:
@@ -125,6 +143,8 @@ jobs:
           tag_name: ${{ inputs.release || github.ref_name }}
           target_commitish: ${{ github.sha }}
           name: VSPO ${{ inputs.release || github.ref_name }}
+          body_path: notes.md  # текст релиза показывает встроенное обновление (☰ → Update)
+          generate_release_notes: true  # добавит ссылку на полный список изменений
           files: |
             dist/VSPO-windows/VSPO.exe
             dist/VSPO-macos/VSPO-mac.zip
