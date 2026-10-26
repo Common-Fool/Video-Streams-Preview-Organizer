@@ -1,0 +1,36 @@
+name: Bug report
+description: Something doesn't work, crashes or produces a wrong result
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: VSPO version
+      description: Shown in the app menu (e.g. 1.2).
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [Windows, macOS, Linux]
+    validations:
+      required: true
+  - type: input
+    id: ffmpeg
+    attributes:
+      label: ffmpeg version
+      description: Output of `ffmpeg -version` (first line).
+  - type: textarea
+    id: log
+    attributes:
+      label: Log or error message
+      description: Any error text or the relevant part of the log.
+      render: text
