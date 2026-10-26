@@ -22,7 +22,7 @@ The whole program is a single Python file (`pairview.py`, standard library only)
 - **Video player.** Play a folder, a selection or a single video in the player of your choice (menu ☰ → Video player: installed players are detected — MPC-HC, MPC-BE, VLC, PotPlayer, mpv, IINA, Celluloid…, or any program). MPC-HC is recommended on Windows: only with it videos can be appended to the playlist without starting playback, and the player window is brought to the front. Show any file in Explorer / Finder / the file manager.
 - **Folder switching.** The last opened folder reopens automatically; another one can be picked from the header (recent folders or a folder dialog) without restarting.
 - **Updates from GitHub.** The menu (☰) checks for a new release; one click downloads it, replaces the program (exe, app or AppImage) and restarts VSPO with the same folder. A green dot on the menu button means an update is available.
-- **Network-friendly. Built for videos on an SMB share: no repeated directory walks in request handlers, the trash counter is kept in memory, preview images are read once and closed immediately.
+- **Network-friendly.** Built for videos on an SMB share: no repeated directory walks in request handlers, the trash counter is kept in memory, preview images are read once and closed immediately.
 
 ## Download
 
@@ -30,7 +30,7 @@ Ready builds are on the [releases page](https://github.com/Common-Fool/Video-Str
 
 | System | File | Notes |
 |---|---|---|
-| Windows 10/11 | `VSPO.exe` | Single file, just run it. |
+| Windows 10/11 | `VSPO.exe` | Single file, just run it. The exe is not code-signed, so SmartScreen may show "Windows protected your PC" on the first start: click **More info** → **Run anyway**. |
 | macOS 11+ (Apple Silicon) | `VSPO-mac.zip` | Unpack and move `VSPO.app` to Applications. The app is not signed by Apple, so the first start is blocked: right-click `VSPO.app` → **Open** → **Open**, or run `xattr -cr /Applications/VSPO.app` in Terminal once. |
 | Linux x86-64 | `VSPO-x86_64.AppImage` | `chmod +x VSPO-x86_64.AppImage` and run it. Opens the gallery in your browser (for an app window, run from source with pywebview, see below). |
 
