@@ -18,9 +18,9 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'  # pythonnet (нужен pywebview) отстаёт с поддержкой самых новых версий
 
@@ -35,7 +35,7 @@ jobs:
           pyinstaller --onefile --noconsole --name VSPO --icon assets/vspo.ico
           --collect-all webview --collect-all pythonnet --collect-all clr_loader pairview.py
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: VSPO-windows
           path: dist/VSPO.exe
@@ -43,9 +43,9 @@ jobs:
   macos:
     runs-on: macos-latest  # Apple Silicon (arm64)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -61,7 +61,7 @@ jobs:
         # ditto сохраняет права и символические ссылки внутри .app (обычный zip их теряет)
         run: ditto -c -k --keepParent dist/VSPO.app VSPO-mac.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: VSPO-macos
           path: VSPO-mac.zip
@@ -69,9 +69,9 @@ jobs:
   linux:
     runs-on: ubuntu-22.04  # старая glibc: AppImage запустится и на дистрибутивах постарше
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -99,7 +99,7 @@ jobs:
           chmod +x appimagetool-x86_64.AppImage
           ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run AppDir VSPO-x86_64.AppImage
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: VSPO-linux
           path: VSPO-x86_64.AppImage
@@ -111,7 +111,7 @@ jobs:
     permissions:
       contents: write  # создать релиз и выложить в него сборки
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0  # вся история и теги: для списка изменений с прошлого релиза
 
@@ -134,11 +134,11 @@ jobs:
           } > notes.md
           cat notes.md
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.release || github.ref_name }}
           target_commitish: ${{ github.sha }}
