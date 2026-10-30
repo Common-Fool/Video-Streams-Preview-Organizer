@@ -2654,6 +2654,37 @@ def open_link(name):
 MAX_BODY = 4 * 1024 * 1024
 
 
+VIDEO_CHUNK = 2 << 20  # кусок отдачи видео: файл открывается на каждый кусок, по SMB это один лишний запрос на 2 МБ
+# MIME для встроенного плеера; остальное (avi, wmv, ts…) Chromium обычно не играет — страница предложит внешний плеер
+VIDEO_TYPES = {'.mp4': 'video/mp4', '.m4v': 'video/mp4', '.mov': 'video/mp4', '.webm': 'video/webm',
+               '.mkv': 'video/x-matroska', '.ogv': 'video/ogg'}
+
+
+def parse_range(header, size):
+    """Заголовок Range для файла в size байт: None — отдать целиком (200), (a, b) включительно — 206, ValueError — 416.
+
+    Несколько диапазонов не поддерживаем: законно ответить целым файлом.
+    """
+    if not header or not header.strip().lower().startswith('bytes='):
+        return None
+    spec = header.strip()[6:].strip()
+    if ',' in spec:
+        return None
+    m = re.fullmatch(r'(\d*)\s*-\s*(\d*)', spec)
+    if not m or not (m.group(1) or m.group(2)) or size <= 0:
+        raise ValueError('bad range')
+    if not m.group(1):  # bytes=-n: последние n байт
+        n = int(m.group(2))
+        if n <= 0:
+            raise ValueError('bad range')
+        return max(0, size - n), size - 1
+    a = int(m.group(1))
+    b = int(m.group(2)) if m.group(2) else size - 1
+    if a >= size or b < a:
+        raise ValueError('bad range')
+    return a, min(b, size - 1)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
@@ -2685,6 +2716,56 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'private, max-age=3600')
         self.end_headers()
         self.wfile.write(data)
+
+    def video(self, gid):
+        """Видео пары для встроенного плеера, с Range (<video> перематывает именно так).
+
+        Файл открывается заново на каждый кусок и сразу закрывается: <video> держит соединение, пока буфер полон,
+        и открытый всё это время файл в Windows не дал бы удалить или обрезать видео («файл занят»).
+        """
+        with LOCK:
+            g = GROUPS.get(gid)
+        if not g or not g['v']:
+            raise LookupError('no video')
+        path = lp(g['v'][0][0])
+        st = os.stat(path)
+        size = st.st_size
+        try:
+            rng = parse_range(self.headers.get('Range'), size)
+        except ValueError:
+            body = b'{"error": "range not satisfiable"}'
+            self.send_response(416)
+            self.send_header('Content-Range', 'bytes */%d' % size)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        code, (a, b) = (200, (0, size - 1)) if rng is None else (206, rng)
+        self.send_response(code)
+        self.send_header('Content-Type', VIDEO_TYPES.get(os.path.splitext(path)[1].lower(), 'application/octet-stream'))
+        self.send_header('Content-Length', str(max(0, b - a + 1)))
+        self.send_header('Accept-Ranges', 'bytes')
+        self.send_header('Cache-Control', 'no-store')
+        if code == 206:
+            self.send_header('Content-Range', 'bytes %d-%d/%d' % (a, b, size))
+        self.end_headers()
+        pos = a
+        while pos <= b:
+            try:
+                with open(path, 'rb') as f:
+                    if os.fstat(f.fileno()).st_mtime != st.st_mtime:  # файл заменили (обрезка): не смешивать два файла
+                        break
+                    f.seek(pos)
+                    chunk = f.read(min(VIDEO_CHUNK, b - pos + 1))
+            except OSError:
+                break
+            if not chunk:
+                break
+            self.wfile.write(chunk)
+            pos += len(chunk)
+        if pos <= b:  # обещанную длину уже не выполнить — соединение закрываем, браузер переспросит
+            self.close_connection = True
 
     @staticmethod
     def jbody(raw):
@@ -2752,6 +2833,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, open_link(self.jbody(raw).get('name')))
             elif not post and p[0] == 'p' and len(p) == 2:
                 self.image(int(p[1]))
+            elif not post and p[0] == 'v' and len(p) == 2:
+                self.video(int(p[1]))
             elif not post and p == ['api', 'cut']:
                 self.reply(200, cut_status())
             elif not post and len(p) == 4 and p[:3] == ['api', 'cut', 'frame']:
@@ -3019,6 +3102,26 @@ figure.sel .bt,figure:hover .bt{display:flex}
 #v{position:fixed;inset:0;z-index:10;display:flex;flex-direction:column;background:var(--well)}
 #v[hidden],#verr[hidden]{display:none}
 #vi{flex:1;min-height:0;width:100%;object-fit:contain}
+#vi[hidden],#vv[hidden],#vpl[hidden],#vfail[hidden],#vpop[hidden]{display:none}
+#vv{flex:1;min-height:0;width:100%;background:#000;outline:none}
+#vfail{position:absolute;left:50%;top:40%;z-index:3;transform:translate(-50%,-50%);padding:18px 22px;border:1px solid var(--line2);border-radius:12px;background:#1a1c23f2;text-align:center}
+#vfail p{margin:0 0 12px}
+#vpl{padding:4px 16px 6px;background:#14161c;border-top:1px solid var(--line)}
+#vseek{position:relative;height:18px;cursor:pointer;touch-action:none}
+#vtrack,#vfill{position:absolute;left:0;top:7px;height:4px;border-radius:2px;pointer-events:none}
+#vtrack{right:0;background:#ffffff26}
+#vfill{width:0;background:var(--accg)}
+#vknob{position:absolute;top:3px;left:0;width:12px;height:12px;margin-left:-6px;border-radius:50%;background:#fff;box-shadow:0 0 0 2px #0006;pointer-events:none}
+#vseek:hover #vtrack,#vseek:hover #vfill{top:6px;height:6px}
+#vpop{position:absolute;bottom:20px;z-index:3;padding:4px;border:1px solid var(--line2);border-radius:8px;background:#0c0d11;box-shadow:0 8px 24px #000a;pointer-events:none}
+#vptile{width:240px;background:#000 no-repeat}
+#vptime{display:block;padding-top:3px;text-align:center;font-size:12px;font-variant-numeric:tabular-nums}
+#vprow{display:flex;align-items:center;gap:10px;margin-top:2px}
+#vprow .sp{flex:1}
+#vplay{min-width:40px}
+#vtime{color:var(--dim);font-variant-numeric:tabular-nums}
+#vvol{width:100px}
+body.nobar #vpl{display:none}
 #vb{display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;padding:10px 16px;background:var(--panel);border-top:1px solid var(--line)}
 #vtrim{display:flex;align-items:center;gap:8px;color:var(--acc2);font-size:13px}
 #vtrim[hidden]{display:none}
@@ -3272,6 +3375,20 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
 <div id="v" hidden>
   <div id="verr" hidden></div>
   <img id="vi" alt="">
+  <video id="vv" playsinline preload="none" disablepictureinpicture hidden></video>
+  <div id="vfail" hidden><p>This video can't be played here (format or codec).</p><button id="vfext" class="go">Open in the video player</button></div>
+  <div id="vpl" hidden>
+    <div id="vseek"><div id="vtrack"></div><div id="vfill"></div><div id="vknob"></div>
+      <div id="vpop" hidden><div id="vptile"></div><span id="vptime"></span></div></div>
+    <div id="vprow">
+      <button id="vplay" title="Play / pause (Space)">▶</button>
+      <span id="vtime">0:00 / 0:00</span>
+      <button id="vrate" title="Playback speed (Shift+, and Shift+.)">1×</button>
+      <span class="sp"></span>
+      <button id="vmute" title="Mute (M)">Sound on</button>
+      <input id="vvol" type="range" min="0" max="1" step="0.01" aria-label="Volume (↑ ↓)">
+    </div>
+  </div>
   <div id="cut" hidden>
     <div id="cpop" hidden><div id="ctile"></div><img id="cimg" alt=""><span id="ctime"></span></div>
     <div id="ctrack"><div id="cregs"></div><div id="cmark" hidden></div><div id="ccur"></div></div>
@@ -3304,6 +3421,7 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
     <button id="pdir" title="Previous folder ([)">Prev. folder</button>
     <button id="ndir" title="Next folder (])">Next folder</button>
     <button id="vpk" title="Select for bulk actions (X)">Select (X)</button>
+    <button id="vhere" title="Play the video right here (P)">Play here (P)</button>
     <button id="vopen" title="Open in the video player (Enter)">Open video</button>
     <button id="vcut" title="Cut unwanted parts: the start, the end or pieces in the middle (C)">Trim video</button>
     <button id="vdel" class="del" title="Delete the video with its preview (Del)">Delete video</button>
@@ -3362,7 +3480,17 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
       <span><kbd>←</kbd> <kbd>→</kbd></span><span>previous / next</span>
       <span><kbd>I</kbd></span><span>hide the bottom bar</span>
       <span><kbd>C</kbd></span><span>trim the video</span>
+      <span><kbd>P</kbd></span><span>play the video right here / back to the preview</span>
       <span><kbd>Esc</kbd> <kbd>Space</kbd></span><span>close</span>
+      <h3>Built-in player</h3>
+      <span><kbd>Space</kbd></span><span>play / pause</span>
+      <span><kbd>←</kbd> <kbd>→</kbd></span><span>previous / next video (it starts playing)</span>
+      <span><kbd>Shift+←</kbd> <kbd>→</kbd></span><span>seek 5 s (Ctrl — 30 s, Ctrl+Shift — 2 min)</span>
+      <span><kbd>↑</kbd> <kbd>↓</kbd> <kbd>M</kbd></span><span>volume, mute</span>
+      <span><kbd>,</kbd> <kbd>.</kbd></span><span>on pause: frame back / forward</span>
+      <span><kbd>Shift+,</kbd> <kbd>Shift+.</kbd></span><span>slower / faster (0.5× to 2×)</span>
+      <span><kbd>Backspace</kbd></span><span>back to the start</span>
+      <span><kbd>Esc</kbd> <kbd>P</kbd></span><span>back to the preview sheet</span>
       <h3>Trimming</h3>
       <span><kbd>←</kbd> <kbd>→</kbd></span><span>cursor by 1 s (Shift — 10 s, Ctrl — 1 min)</span>
       <span><kbd>I</kbd> <kbd>O</kbd></span><span>start / end of a piece to remove (red)</span>
@@ -3643,7 +3771,7 @@ function showViewer() {
   if (C && (!viewer || !items[cur] || items[cur].id !== C.id)) closeCut(true);
   $('#v').hidden = !viewer;
   document.body.classList.toggle('viewing', viewer);
-  if (!viewer) return;
+  if (!viewer) { if (P.on || P.id !== null) playerOff(); return; }
   const it = items[cur];
   $('#vi').src = purl(it);
   $('#vname').textContent = full(it);
@@ -3656,6 +3784,8 @@ function showViewer() {
   $('#verr').hidden = !it.err;
   $('#verr').textContent = it.err ? 'Not deleted: ' + it.err : '';
   $('#vdel').textContent = it.nv ? 'Delete video' : 'Delete preview';
+  $('#vhere').disabled = !it.nv && !P.on;
+  if (P.on) pShow(it);
   for (const d of [1, 2, -1]) if (items[cur + d]) new Image().src = purl(items[cur + d]);
 }
 
@@ -3688,6 +3818,232 @@ function closeViewer(exitFs = true) {
 }
 // Esc в полноэкранном режиме обрабатывает сам браузер — просмотр закрываем по выходу из полного экрана
 document.addEventListener('fullscreenchange', () => { if (!document.fullscreenElement && viewer) closeViewer(false); });
+
+/* ───── встроенный плеер (как в VO Media): видео прямо в просмотре вместо листа ───── */
+
+// P — состояние плеера: on — режим включён (листание открывает видео следующих превью), id — чьё видео загружено,
+// bad — не играет здесь, seekT — отложенная цель перемотки, info/L — сетка листа для кадра над шкалой
+const vv = $('#vv'), RATES = [0.5, 0.75, 1, 1.25, 1.5, 2];
+const P = {on: false, id: null, ver: null, bad: false, seekT: null, loadT: 0, raf: 0, drag: false, info: null, infoFor: null, L: null};
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+let pVol = clamp(parseFloat(store.get('vol') ?? '1') || 0, 0, 1), pMuted = store.get('mute') === '1';
+let pRate = RATES.includes(+store.get('rate')) ? +store.get('rate') : 1;
+
+function playerOn() {
+  const it = items[cur];
+  if (!viewer || !it) return;
+  if (!it.nv) { toast('This preview has no video', true); return; }
+  if (C) closeCut(true);
+  P.on = true;
+  pShow(it);
+}
+// назад к листу превью; файл видео отпускается (иначе в Windows его нельзя удалить или обрезать)
+function playerOff() {
+  P.on = false;
+  pRelease();
+  $('#vi').hidden = false;
+  $('#vpl').hidden = $('#vfail').hidden = true;
+  $('#vhere').textContent = 'Play here (P)';
+}
+function pRelease() {
+  clearTimeout(P.loadT);
+  cancelAnimationFrame(P.raf);
+  P.drag = false;
+  P.seekT = null;
+  $('#vpop').hidden = true;
+  if (P.id !== null) {
+    vv.pause();
+    vv.removeAttribute('src');
+    vv.load();  // освободить соединение и файл
+    P.id = null;
+  }
+  vv.hidden = true;
+}
+// показать текущее превью в режиме плеера: у видео — загрузить и запустить, у превью без видео — лист
+function pShow(it) {
+  $('#vhere').textContent = 'Show preview (P)';
+  if (!it.nv) {
+    pRelease();
+    $('#vi').hidden = false;
+    $('#vpl').hidden = $('#vfail').hidden = true;
+    return;
+  }
+  // уже загружено (или уже известно, что здесь не играет); версия — по mtime: после Ctrl+Z обрезки на месте другой файл
+  if (P.id === it.id && P.ver === it.mtime) return;
+  pRelease();
+  P.id = it.id;
+  P.ver = it.mtime;
+  P.bad = false;
+  $('#vfail').hidden = true;
+  $('#vi').hidden = true;
+  vv.hidden = false;
+  $('#vpl').hidden = false;
+  vv.preload = 'auto';
+  vv.src = q('/v/' + it.id + '?m=' + Math.round(it.mtime || 0));
+  pApplyVol();
+  vv.playbackRate = pRate;
+  $('#vrate').textContent = pRate + '×';
+  const p = vv.play();
+  if (p && p.catch) p.catch(() => {});
+  P.loadT = setTimeout(() => { if (P.id === it.id && vv.readyState < 2) pFail(); }, 10000);
+  pUi();
+}
+function pFail() {
+  if (P.id === null || P.bad) return;
+  P.bad = true;
+  const id = P.id;
+  pRelease();
+  P.id = id;  // запомнить, чтобы не пытаться снова при каждом показе
+  $('#vi').hidden = false;
+  $('#vpl').hidden = true;
+  $('#vfail').hidden = false;
+  $('#vfext').textContent = 'Open in ' + player.name;
+}
+const pDur = () => (isFinite(vv.duration) && vv.duration > 0 ? vv.duration : 0);
+function pUi() {
+  const d = pDur(), t = P.seekT ?? vv.currentTime ?? 0, pc = d ? clamp(t / d, 0, 1) * 100 : 0;
+  $('#vfill').style.width = pc + '%';
+  $('#vknob').style.left = pc + '%';
+  $('#vtime').textContent = fmtT(t) + ' / ' + fmtT(d);
+  $('#vplay').textContent = vv.paused ? '▶' : '❚❚';
+}
+function pTick() {
+  pUi();
+  if (!vv.paused && !vv.ended) P.raf = requestAnimationFrame(pTick);
+}
+function pToggle() {
+  if (P.id === null || P.bad) return;
+  if (vv.paused) { const p = vv.play(); if (p && p.catch) p.catch(() => {}); } else vv.pause();
+}
+// зажатая клавиша шлёт ~30 перемоток в секунду: каждая новая обрывала бы прошлую до показа кадра (по SMB видео стоит).
+// Пока идёт перемотка, копим цель; последнюю отправит 'seeked'
+function pSeekTo(t) {
+  if (P.id === null || P.bad) return;
+  t = clamp(t, 0, pDur() || t);
+  if (vv.seeking) P.seekT = t;
+  else {
+    P.seekT = null;
+    try { vv.currentTime = t; } catch (_) { /* метаданные ещё не пришли */ }
+  }
+  pUi();
+}
+const pSeekBy = dt => pSeekTo((P.seekT ?? vv.currentTime ?? 0) + dt);
+function pApplyVol() {
+  vv.volume = pVol;
+  vv.muted = pMuted;
+  $('#vvol').value = pMuted ? 0 : pVol;
+  $('#vmute').textContent = pMuted || !pVol ? 'Sound off' : 'Sound on';
+}
+function pVolBy(d) {
+  pVol = clamp(Math.round((pVol + d) * 100) / 100, 0, 1);
+  if (d > 0) pMuted = false;
+  store.set('vol', pVol);
+  store.set('mute', pMuted ? '1' : '0');
+  pApplyVol();
+  toast('Volume ' + Math.round(pVol * 100) + '%');
+}
+function pMute() {
+  pMuted = !pMuted;
+  store.set('mute', pMuted ? '1' : '0');
+  pApplyVol();
+  toast(pMuted ? 'Muted' : 'Volume ' + Math.round(pVol * 100) + '%');
+}
+function pRateBy(dir) {
+  pRate = RATES[clamp(RATES.indexOf(pRate) + dir, 0, RATES.length - 1)];
+  store.set('rate', pRate);
+  vv.playbackRate = pRate;
+  $('#vrate').textContent = pRate + '×';
+  toast('Speed ' + pRate + '×');
+}
+
+// клавиши в режиме плеера; true — клавиша обработана. ←/→ без модификаторов, Del, [ ] и прочее — как в обычном просмотре
+function pKey(e) {
+  if (e.code === 'KeyP' && !e.ctrlKey) { playerOff(); return true; }
+  if (e.code === 'Escape') { playerOff(); return true; }
+  // в режиме плеера Backspace — к началу и никогда не удаление (даже если видео тут не играет); удаление — Del
+  if (e.code === 'Backspace') { if (P.id !== null && !P.bad) pSeekTo(0); return true; }
+  if (P.id === null || P.bad) return false;
+  const k = e.code;
+  if ((k === 'Comma' || k === 'Period') && !e.ctrlKey) {
+    const dir = k === 'Comma' ? -1 : 1;
+    if (e.shiftKey) pRateBy(dir);
+    else if (vv.paused) pSeekBy(dir / 30);  // кадр назад/вперёд (около 1/30 с)
+    return true;
+  }
+  switch (k) {
+    case 'Space': pToggle(); return true;
+    case 'ArrowUp': pVolBy(0.05); return true;
+    case 'ArrowDown': pVolBy(-0.05); return true;
+    case 'KeyM': if (e.ctrlKey) return false; pMute(); return true;
+    case 'ArrowLeft': case 'ArrowRight':
+      if (!e.ctrlKey && !e.shiftKey) return false;
+      pSeekBy((k === 'ArrowLeft' ? -1 : 1) * (e.ctrlKey ? (e.shiftKey ? 120 : 30) : 5));
+      return true;
+  }
+  return false;
+}
+
+vv.addEventListener('play', () => { cancelAnimationFrame(P.raf); P.raf = requestAnimationFrame(pTick); });
+vv.addEventListener('pause', pUi);
+vv.addEventListener('timeupdate', () => { if (!P.drag) pUi(); });
+vv.addEventListener('loadedmetadata', pUi);
+vv.addEventListener('loadeddata', () => clearTimeout(P.loadT));
+vv.addEventListener('seeked', () => {
+  if (P.seekT !== null) { const t = P.seekT; P.seekT = null; pSeekTo(t); }
+});
+vv.addEventListener('error', () => { if (vv.error && P.id !== null) pFail(); });
+vv.onclick = pToggle;
+$('#vplay').onclick = pToggle;
+$('#vmute').onclick = pMute;
+$('#vrate').onclick = () => pRateBy(pRate >= 2 ? -RATES.length : 1);
+$('#vvol').oninput = e => {
+  pVol = +e.target.value;
+  pMuted = pVol === 0;
+  store.set('vol', pVol);
+  store.set('mute', pMuted ? '1' : '0');
+  pApplyVol();
+};
+$('#vvol').onchange = e => e.target.blur();
+$('#vhere').onclick = () => (P.on ? playerOff() : playerOn());
+$('#vfext').onclick = openCur;
+
+// шкала: клик и перетаскивание — перемотка; над шкалой — клетка листа превью для этого момента
+const seek = $('#vseek');
+const seekT = e => {
+  const r = seek.getBoundingClientRect();
+  return clamp((e.clientX - r.left) / r.width, 0, 1) * pDur();
+};
+seek.onpointerdown = e => {
+  if (e.button !== 0 || !pDur()) return;
+  try { seek.setPointerCapture(e.pointerId); } catch (_) { /* без захвата перетаскивание за край оборвётся */ }
+  P.drag = true;
+  pSeekTo(seekT(e));
+};
+seek.onpointermove = e => {
+  if (!pDur()) return;
+  const t = seekT(e);
+  if (P.drag) pSeekTo(t);
+  pPop(t, e.clientX);
+};
+seek.onpointerup = () => { P.drag = false; };
+seek.onpointerleave = () => { if (!P.drag) $('#vpop').hidden = true; };
+function pPop(t, clientX) {
+  const it = items[cur], pop = $('#vpop'), box = seek.getBoundingClientRect(), PW = 240;
+  if (!it || P.id !== it.id) return;
+  if (P.infoFor !== it.id && ff.ok && it.nv === 1) {  // сетка листа — один запрос на видео; без ffmpeg только время
+    P.infoFor = it.id;
+    P.info = P.L = null;
+    api('/api/cut/info', true, {id: it.id})
+      .then(i => { if (P.infoFor === it.id) { P.info = i; P.L = sheetLayout(i); } })
+      .catch(() => {});
+  }
+  pop.hidden = false;
+  $('#vptile').hidden = !P.L;
+  if (P.L) paintTile($('#vptile'), P.L, P.info, t, pDur(), PW);
+  $('#vptime').textContent = fmtT(t, true);
+  const w = P.L ? PW + 10 : pop.offsetWidth;
+  pop.style.left = clamp(clientX - box.left - w / 2, 0, Math.max(0, box.width - w)) + 'px';
+}
 
 /* ───── обрезка видео (без перекодирования) ───── */
 
@@ -3722,6 +4078,7 @@ async function openCut() {
   if (!ff.ok) { toast('ffmpeg not found: cannot trim', true); return; }
   if (job.running) { toast('Previews are being created: trim after it finishes', true); return; }
   if (cutSt.running) { toast('Another video is being trimmed: wait until it finishes', true); return; }
+  if (P.on) playerOff();  // обрезке нужен лист превью, а файл видео не должен быть занят плеером
   let info;
   try {
     info = await api('/api/cut/info', true, {id: it.id});
@@ -3729,7 +4086,8 @@ async function openCut() {
     toast('Trimming unavailable: ' + e.message, true);
     return;
   }
-  if (!viewer || items[cur] !== it) return;
+  if (!viewer || items[cur] !== it || C) return;
+  if (P.on) playerOff();  // пока ждали ответ, могли снова включить плеер (P)
   C = {id: it.id, d: info.duration, info, cuts: [], sel: -1, cur: 0, mark: null, snaps: {}, L: null,
        drag: null, popT: null};
   $('#v').classList.add('cutting');
@@ -3750,14 +4108,28 @@ async function closeCut(force) {
 
 // где в листе превью лежит каждый кадр: сетка — от сервера (как её строит make_preview), размер листа — по картинке.
 // Не сошлось (лист сделан не этой программой или с другими параметрами) — всплывают только точные кадры.
-function cutLayout() {
-  const im = $('#vi'), i = C.info, W = im.naturalWidth, H = im.naturalHeight;
-  C.L = null;
-  if (!W || W !== i.width || !i.w || !i.h) return;
+function sheetLayout(i) {  // i — ответ /api/cut/info; null — лист в #vi не узнан
+  const im = $('#vi'), W = im.naturalWidth, H = im.naturalHeight;
+  if (!W || W !== i.width || !i.w || !i.h) return null;
   const tw = Math.floor((i.width - (i.cols - 1)) / i.cols);
   const th = (H - i.hh - (i.rows - 1)) / i.rows;
-  if (!Number.isInteger(th) || Math.abs(th - tw * i.h / i.w) > 2.5) return;
-  C.L = {tw, th, W, H, n: i.cols * i.rows};
+  if (!Number.isInteger(th) || Math.abs(th - tw * i.h / i.w) > 2.5) return null;
+  return {tw, th, W, H, n: i.cols * i.rows};
+}
+function cutLayout() { C.L = sheetLayout(C.info); }
+// клетка листа превью для момента t видео длиной d — фоном элемента tile шириной PW
+function paintTile(tile, L, i, t, d, PW) {
+  if (L) {
+    const k = Math.min(L.n - 1, Math.max(0, Math.round(t / d * L.n)));
+    const col = k % i.cols, row = Math.floor(k / i.cols), s = PW / L.tw;
+    tile.style.backgroundImage = 'url("' + $('#vi').src + '")';
+    tile.style.backgroundSize = (L.W * s) + 'px ' + (L.H * s) + 'px';
+    tile.style.backgroundPosition = (-col * (L.tw + 1) * s) + 'px ' + (-(i.hh + row * (L.th + 1)) * s) + 'px';
+    tile.style.height = Math.round(L.th * s) + 'px';
+  } else {
+    tile.style.backgroundImage = 'none';
+    tile.style.height = Math.round(PW * (i.h / i.w || 0.5625)) + 'px';
+  }
 }
 $('#vi').addEventListener('load', () => { if (C) cutLayout(); });
 
@@ -3865,17 +4237,7 @@ function popAt(t, clientX) {
   const pop = $('#cpop'), box = $('#cut').getBoundingClientRect(), i = C.info, PW = 320, tile = $('#ctile');
   C.popT = t;
   pop.hidden = false;
-  if (C.L) {
-    const L = C.L, k = Math.min(L.n - 1, Math.max(0, Math.round(t / C.d * L.n)));
-    const col = k % i.cols, row = Math.floor(k / i.cols), s = PW / L.tw;
-    tile.style.backgroundImage = 'url("' + $('#vi').src + '")';
-    tile.style.backgroundSize = (L.W * s) + 'px ' + (L.H * s) + 'px';
-    tile.style.backgroundPosition = (-col * (L.tw + 1) * s) + 'px ' + (-(i.hh + row * (L.th + 1)) * s) + 'px';
-    tile.style.height = Math.round(L.th * s) + 'px';
-  } else {
-    tile.style.backgroundImage = 'none';
-    tile.style.height = Math.round(PW * (i.h / i.w || 0.5625)) + 'px';
-  }
+  paintTile(tile, C.L, i, t, C.d, PW);
   $('#ctime').textContent = fmtT(t, true);
   pop.style.left = Math.max(0, Math.min(box.width - PW - 12, clientX - box.left - PW / 2 - 4)) + 'px';
   const im = $('#cimg');
@@ -4093,6 +4455,7 @@ async function removeCur() {
     grid.replaceChild(tile(it), grid.children[cur]);
     select(cur, false);
   }
+  if (P.id === it.id) pRelease();  // играющий здесь файл в Windows не перенести; режим плеера остаётся для следующего
   const f0 = grid.children[cur];
   f0.classList.add('wait');
   $('#v').classList.add('wait');
@@ -4240,6 +4603,7 @@ addEventListener('keydown', e => {
   }
   if (e.target.matches('select,input')) return;
   if (C && viewer) { cutKey(e); return; }
+  if (P.on && viewer && $('#ov').hidden && !e.altKey && !e.metaKey && pKey(e)) { e.preventDefault(); return; }
   if (!$('#ov').hidden) {  // открыто окно меню (донаты, обновление, клавиши): Esc закрывает, остальное не трогаем
     if (e.code === 'Escape') { e.preventDefault(); closeSheet(); }
     return;
@@ -4275,6 +4639,7 @@ addEventListener('keydown', e => {
     case 'KeyA': if (e.ctrlKey || e.metaKey) { items.forEach(i => picked.add(i.id)); pickStat(); } else return; break;
     case 'KeyE': showCur(); break;
     case 'KeyC': if (!viewer) return; openCut(); break;
+    case 'KeyP': if (!viewer || e.ctrlKey) return; playerOn(); break;
     case 'KeyI':
       if (!viewer) return;
       document.body.classList.toggle('nobar');
