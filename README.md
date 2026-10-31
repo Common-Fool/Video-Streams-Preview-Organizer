@@ -1,6 +1,6 @@
-<img src="assets/vspo.png" width="96" align="right" alt="">
+<img src="assets/vo_sp.png" width="96" align="right" alt="">
 
-# VSPO — Video Streams Preview Organizer
+# VO SP — Video Organizer: Streams Preview
 
 A desktop tool for Windows, macOS and Linux for browsing, cleaning up and trimming large video collections (stream recordings, archives on a NAS) through their **contact sheets** — preview images with a grid of timestamped frames.
 
@@ -21,20 +21,23 @@ The whole program is a single Python file (`pairview.py`, standard library only)
 
 - **Video player.** Play a folder, a selection or a single video in the player of your choice (menu ☰ → Video player: installed players are detected — MPC-HC, MPC-BE, VLC, PotPlayer, mpv, IINA, Celluloid…, or any program). MPC-HC is recommended on Windows: only with it videos can be appended to the playlist without starting playback, and the player window is brought to the front. Show any file in Explorer / Finder / the file manager.
 - **Folder switching.** The last opened folder reopens automatically; another one can be picked from the header (recent folders or a folder dialog) without restarting.
-- **Updates from GitHub.** The menu (☰) checks for a new release; one click downloads it, replaces the program (exe, app or AppImage) and restarts VSPO with the same folder. A green dot on the menu button means an update is available.
+- **Updates from GitHub.** The menu (☰) checks for a new release; one click downloads it, replaces the program (exe, app or AppImage) and restarts VO SP with the same folder. A green dot on the menu button means an update is available.
 - **Network-friendly.** Built for videos on an SMB share: no repeated directory walks in request handlers, the trash counter is kept in memory, preview images are read once and closed immediately.
 
 ## Download
 
 Ready builds are on the [releases page](https://github.com/Common-Fool/Video-Streams-Preview-Organizer/releases/latest). Later versions install themselves from the menu (☰ → Update).
 
+> [!NOTE]
+> Since v1.5 the app is called **VO SP** (it was VSPO) and the release files are named `VO_SP…`. VSPO 1.4 and older cannot find them, so download v1.5 once by hand; after that updates work from the menu again.
+
 | System | File | Notes |
 |---|---|---|
-| Windows 10/11 | `VSPO.exe` | Single file, just run it. The exe is not code-signed, so SmartScreen may show "Windows protected your PC" on the first start: click **More info** → **Run anyway**. |
-| macOS 11+ (Apple Silicon) | `VSPO-mac.zip` | Unpack and move `VSPO.app` to Applications. The app is not signed by Apple, so the first start is blocked: right-click `VSPO.app` → **Open** → **Open**, or run `xattr -cr /Applications/VSPO.app` in Terminal once. |
-| Linux x86-64 | `VSPO-x86_64.AppImage` | `chmod +x VSPO-x86_64.AppImage` and run it. Opens the gallery in your browser (for an app window, run from source with pywebview, see below). |
+| Windows 10/11 | `VO_SP.exe` | Single file, just run it. The exe is not code-signed, so SmartScreen may show "Windows protected your PC" on the first start: click **More info** → **Run anyway**. |
+| macOS 11+ (Apple Silicon) | `VO_SP-mac.zip` | Unpack and move `VO_SP.app` to Applications. The app is not signed by Apple, so the first start is blocked: right-click `VO_SP.app` → **Open** → **Open**, or run `xattr -cr /Applications/VO_SP.app` in Terminal once. |
+| Linux x86-64 | `VO_SP-x86_64.AppImage` | `chmod +x VO_SP-x86_64.AppImage` and run it. Opens the gallery in your browser (for an app window, run from source with pywebview, see below). |
 
-ffmpeg is not bundled. Windows: put `ffmpeg.exe` and `ffprobe.exe` next to `VSPO.exe` or in `PATH`. macOS: `brew install ffmpeg`. Linux: `sudo apt install ffmpeg` (or your distribution's package).
+ffmpeg is not bundled. Windows: put `ffmpeg.exe` and `ffprobe.exe` next to `VO_SP.exe` or in `PATH`. macOS: `brew install ffmpeg`. Linux: `sudo apt install ffmpeg` (or your distribution's package).
 
 ## Requirements (running from source)
 
@@ -85,14 +88,14 @@ Persistent options can be put into `pairview.json` next to the program or in `%A
 
 ## Building
 
-GitHub Actions builds `VSPO.exe`, `VSPO-mac.zip` and `VSPO-x86_64.AppImage` on every push (workflow **Build**, also runnable by hand): download them from the run's **Artifacts**. Pushing a tag like `v1.2`, or running the workflow by hand with a tag in the **release** field, also publishes them as a GitHub release. The tag must match `VERSION` in `pairview.py` (the build checks it): that is how the in-app updater compares versions. To build locally on Windows:
+GitHub Actions builds `VO_SP.exe`, `VO_SP-mac.zip` and `VO_SP-x86_64.AppImage` on every push (workflow **Build**, also runnable by hand): download them from the run's **Artifacts**. Pushing a tag like `v1.2`, or running the workflow by hand with a tag in the **release** field, also publishes them as a GitHub release. The tag must match `VERSION` in `pairview.py` (the build checks it): that is how the in-app updater compares versions. To build locally on Windows:
 
 ```bat
 pip install pyinstaller pywebview
-pyinstaller --onefile --noconsole --name VSPO --icon assets/vspo.ico --collect-all webview --collect-all pythonnet --collect-all clr_loader pairview.py
+pyinstaller --onefile --noconsole --name VO_SP --icon assets/vo_sp.ico --collect-all webview --collect-all pythonnet --collect-all clr_loader pairview.py
 ```
 
-The result is a single `dist\VSPO.exe`. The macOS and Linux build commands are in [`.github/workflows/build.yml`](.github/workflows/build.yml).
+The result is a single `dist\VO_SP.exe`. The macOS and Linux build commands are in [`.github/workflows/build.yml`](.github/workflows/build.yml).
 
 ## Notes
 
@@ -103,7 +106,7 @@ The result is a single `dist\VSPO.exe`. The macOS and Linux build commands are i
 
 ## Support
 
-VSPO is free. If it saves you time, you can support its development:
+VO SP is free. If it saves you time, you can support its development:
 
 - [Monobank jar](https://send.monobank.ua/jar/6m4nBQCW9B) (card of any bank)
 - [Ko-fi](https://ko-fi.com/commonfool)

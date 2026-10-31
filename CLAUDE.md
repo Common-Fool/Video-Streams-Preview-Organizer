@@ -2,12 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-# VSPO (pairview.py)
+# VO SP (pairview.py)
 
 Один файл `pairview.py` (~4200 строк, Python 3.8+, только стандартная библиотека; `pywebview` и `ffmpeg` — внешние, необязательные).
 Программа для Windows (основная система владельца), работает и на macOS/Linux: галерея превью-листов («contact sheets» с таймкодами) к видео. Ходит по папке и подпапкам, связывает видео и превью по имени,
 даёт парное удаление, групповые действия, создание недостающих превью через ffmpeg, запуск в выбранном видеоплеере (рекомендуем MPC-HC), открытие в проводнике.
-Название — VSPO (Video Streams Preview Organizer), константа `APP`. Интерфейс — локальный веб-сервер + страница (HTML/CSS/JS лежат внутри строки `PAGE`). Открывается в собственном окне (pywebview/WebView2) или в браузере.
+Название — VO SP (Video Organizer: Streams Preview), константа `APP`; имена файлов сборки — `VO_SP` (до v1.4 — VSPO). Интерфейс — локальный веб-сервер + страница (HTML/CSS/JS лежат внутри строки `PAGE`). Открывается в собственном окне (pywebview/WebView2) или в браузере.
 
 ## Договорённости с владельцем (важно, соблюдать)
 
@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - На вопрос «как сделать X» отвечать на вопрос, а не запускать сам длинную серию команд. Не гонять сотни тестов.
 - Не пытаться воспроизводить в Linux-песочнице поведение Windows, скорость, pywebview, MPC, NVIDIA: это проверяет владелец на своей машине.
   Минимум самопроверки перед сдачей: `python -m py_compile pairview.py` и проверка синтаксиса JS (см. «Как проверять»).
-- Имя файла `pairview.py` не менять. Название в окне, заголовке страницы и у exe — «VSPO» (константа `APP`). Иконка — `assets/vspo.ico`
+- Имя файла `pairview.py` не менять. Название в окне и заголовке страницы — «VO SP» (константа `APP`), у exe и прочих файлов — `VO_SP`. Иконка — `assets/vo_sp.ico`
   (рисует `assets/make_icon.py`, нужен Pillow; в странице — такой же SVG в `<link rel="icon">`).
 - Интерфейс, сообщения, журнал и `--help` — на английском. Комментарии и докстринги в коде — по-русски.
 - В интерфейсе не «пара», а видео: «Delete video» (видео уходит вместе с превью). Слово «пара» осталось только во внутренних именах и комментариях.
@@ -136,11 +136,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `VERSION` — версия программы; тег релиза должен быть `v` + `VERSION` (сборка релиза это проверяет и падает при расхождении). Перед новым релизом поднять `VERSION`.
 - Проверка: `check_update()` — `api.github.com/repos/<REPO>/releases/latest` (urllib, без ключа), один раз за запуск в фоне (по первому `GET /api/app`)
   и по кнопке в меню. Есть новее — зелёная точка на кнопке меню (☰) и пункт «Update to vX.Y».
-- Вид установки — `install_kind()`: `exe` (Windows), `app` (macOS, `VSPO.app`), `appimage` (Linux, переменная `APPIMAGE`), `source` (pairview.py),
-  `''` — собрано как-то иначе, самообновления нет (страница предлагает скачать вручную). Файл релиза под каждый вид — `ASSETS`.
+- Вид установки — `install_kind()`: `exe` (Windows), `app` (macOS, `VO_SP.app`), `appimage` (Linux, переменная `APPIMAGE`), `source` (pairview.py),
+  `''` — собрано как-то иначе, самообновления нет (страница предлагает скачать вручную). Файл релиза под каждый вид — `ASSETS`. С v1.5 файлы называются `VO_SP*`: версии до v1.4 (VSPO) ищут `VSPO*` и сами не обновятся — только вручную (решение владельца).
 - Установка (`update_worker`): скачать файл релиза (проверка размера, сигнатуры `MZ`/`PK`/ELF, sha256 из поля `digest`, если GitHub его дал).
-  exe — запущенный exe переименовать в `VSPO.exe.old` (перезаписать его в Windows нельзя, переименовать можно) → новый на его место.
-  app — `install_app()`: `ditto -x -k` во временную папку рядом с .app (ditto сохраняет права и ссылки), старое приложение → `VSPO.app.old`, новое на место;
+  exe — запущенный exe переименовать в `VO_SP.exe.old` (перезаписать его в Windows нельзя, переименовать можно) → новый на его место.
+  app — `install_app()`: `ditto -x -k` во временную папку рядом с .app (ditto сохраняет права и ссылки), старое приложение → `VO_SP.app.old`, новое на место;
   скачанное нами не помечается карантином, Gatekeeper обновление не останавливает. AppImage и pairview.py (скачивается с тега, проверка `compile`) —
   `os.replace` поверх (в Linux/macOS запущенный файл так заменить можно). Потом `restart()`: тот же набор параметров, у собранных —
   `PYINSTALLER_RESET_ENVIRONMENT=1` и без `_MEI*`/`_PYI*`/`APPIMAGE*` в окружении; затем `os._exit(0)`.
@@ -261,20 +261,20 @@ pythonw.exe pairview.py "D:\Видео"     # без консоли (ярлык)
 ## Сборка (PyInstaller, GitHub Actions)
 
 Сборку делает GitHub Actions (`.github/workflows/build.yml`, workflow «Build»): при каждом push (и вручную — Run workflow) три задачи с Python 3.12:
-`windows-latest` → `VSPO.exe` (onefile), `macos-latest` (arm64) → `VSPO.app` в `VSPO-mac.zip` (ditto), `ubuntu-22.04` → onedir без pywebview,
-упакованный appimagetool в `VSPO-x86_64.AppImage` (WebKitGTK в AppImage не упаковывается: AppImage открывает браузер). Артефакты `VSPO-windows`,
-`VSPO-macos`, `VSPO-linux`. Тег `v*` или ручной запуск с тегом в поле release → задача `release` сверяет тег с `VERSION` и выкладывает все три файла.
+`windows-latest` → `VO_SP.exe` (onefile), `macos-latest` (arm64) → `VO_SP.app` в `VO_SP-mac.zip` (ditto), `ubuntu-22.04` → onedir без pywebview,
+упакованный appimagetool в `VO_SP-x86_64.AppImage` (WebKitGTK в AppImage не упаковывается: AppImage открывает браузер). Артефакты `VO_SP-windows`,
+`VO_SP-macos`, `VO_SP-linux`. Тег `v*` или ручной запуск с тегом в поле release → задача `release` сверяет тег с `VERSION` и выкладывает все три файла.
 macOS-приложение не подписано Apple: первый запуск — правый клик → Open или `xattr -cr`. Особенности собранных версий: `base_dir()` — рядом с .app /
 .AppImage; `fix_env()` — Homebrew в PATH на macOS, исходный `LD_LIBRARY_PATH` для дочерних процессов в Linux; `die()` на macOS — `osascript`.
 Вручную на Windows:
 
 ```
 pip install pyinstaller pywebview
-pyinstaller --onefile --noconsole --name VSPO --icon assets/vspo.ico --collect-all webview --collect-all pythonnet --collect-all clr_loader pairview.py
+pyinstaller --onefile --noconsole --name VO_SP --icon assets/vo_sp.ico --collect-all webview --collect-all pythonnet --collect-all clr_loader pairview.py
 ```
 
-- Результат — один файл `dist\VSPO.exe`. Копировать нужно только его. `build\`, `dist\` и `VSPO.spec` — временные, можно удалять (результат в `dist`).
-- Без `--onefile` получится папка `dist\VSPO\` (быстрее запускается, антивирус ругается реже); копировать её надо целиком.
+- Результат — один файл `dist\VO_SP.exe`. Копировать нужно только его. `build\`, `dist\` и `VO_SP.spec` — временные, можно удалять (результат в `dist`).
+- Без `--onefile` получится папка `dist\VO_SP\` (быстрее запускается, антивирус ругается реже); копировать её надо целиком.
 - Python лучше 3.12: у `pythonnet` (нужен pywebview в Windows) бывают задержки с поддержкой самых новых версий.
 - После любой правки кода exe нужно пересобрать (Actions делают это сами при push).
 - ffmpeg в exe **не входит**: `ffmpeg.exe` и `ffprobe.exe` кладутся рядом с exe, либо в PATH, либо путь в `--ffmpeg`/`pairview.json`.

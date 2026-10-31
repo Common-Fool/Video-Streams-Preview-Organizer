@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-r"""VSPO — Video Streams Preview Organizer (pairview.py): browse preview sheets, delete videos, create previews, play in a video player.
+r"""VO SP — Video Organizer: Streams Preview (pairview.py): browse preview sheets, delete videos, create previews, play in a video player.
 
   python pairview.py FOLDER                       videos and previews stored together (subfolders too)
   python pairview.py FOLDER --previews FOLDER2    previews in a separate folder (same subfolders)
@@ -56,7 +56,7 @@ IGNORE = {'.ts'}        # расширения видео, файлы с кот�
 SCAN = {'ignored': 0}   # сколько файлов пропущено при последнем сканировании
 TRASH = '_to_delete'
 TRASH_NAMES = (TRASH, '_на_удаление')  # второе — прежнее имя корзины: такие папки тоже корзина
-APP = 'VSPO'  # название в окне, в заголовке страницы и у exe (Video Streams Preview Organizer)
+APP = 'VO SP'  # название в окне и в заголовке страницы (Video Organizer: Streams Preview); имена файлов — VO_SP
 TOKEN = secrets.token_urlsafe(12)
 ROOT_NAME = ''
 PLAYER = {'path': '', 'name': 'default app', 'kind': ''}  # видеоплеер: путь ('' — программа системы), имя, 'mpc' для MPC-HC/BE
@@ -722,7 +722,7 @@ def base_dir():
     """
     if getattr(sys, 'frozen', False):
         app = mac_bundle()
-        if app:  # macOS: сам exe лежит внутри VSPO.app/Contents/MacOS, «рядом с программой» — это рядом с .app
+        if app:  # macOS: сам exe лежит внутри VO_SP.app/Contents/MacOS, «рядом с программой» — это рядом с .app
             return os.path.dirname(app)
         if os.environ.get('APPIMAGE'):  # Linux AppImage: рядом с файлом .AppImage, а не во временной точке монтирования
             return os.path.dirname(os.path.abspath(os.environ['APPIMAGE']))
@@ -731,7 +731,7 @@ def base_dir():
 
 
 def mac_bundle():
-    """Путь к VSPO.app, если программа запущена из собранного приложения macOS; иначе ''."""
+    """Путь к VO_SP.app, если программа запущена из собранного приложения macOS; иначе ''."""
     if sys.platform != 'darwin' or not getattr(sys, 'frozen', False):
         return ''
     p = os.path.abspath(sys.executable)
@@ -2377,7 +2377,7 @@ LINKS = {  # внешние ссылки открываются только п�
     'crypto': 'https://nowpayments.io/donation/commonfool',
     'mpc': 'https://github.com/clsid2/mpc-hc/releases',
 }
-ASSETS = {'exe': 'VSPO.exe', 'app': 'VSPO-mac.zip', 'appimage': 'VSPO-x86_64.AppImage'}  # файл релиза под каждый вид установки
+ASSETS = {'exe': 'VO_SP.exe', 'app': 'VO_SP-mac.zip', 'appimage': 'VO_SP-x86_64.AppImage'}  # файл релиза под каждый вид установки
 DONATE_DAYS = (7, 30)  # напоминание о донатах: обычно и после «Remind me less often»
 UPD = {'checked': 0, 'checking': False, 'error': '', 'latest': '', 'newer': False, 'page': '', 'notes': '',
        'asset': '', 'size': 0, 'digest': '', 'running': False, 'stage': '', 'done': 0, 'total': 0}
@@ -2490,7 +2490,7 @@ def update_worker():
             dst = os.path.abspath(__file__)
             data, _ = download('https://raw.githubusercontent.com/%s/%s/pairview.py' % (REPO, tag))
             compile(data, dst, 'exec')  # битый или чужой файл не ставим
-            if b"APP = 'VSPO'" not in data:
+            if b"APP = 'VO SP'" not in data:
                 raise RuntimeError('unexpected file')
         else:
             data, sha = download(asset, size)
@@ -2539,20 +2539,20 @@ def update_worker():
 
 
 def install_app(app, data):
-    """macOS: распаковать VSPO.app рядом со старым (ditto сохраняет права и ссылки внутри приложения) и поменять местами.
+    """macOS: распаковать VO_SP.app рядом со старым (ditto сохраняет права и ссылки внутри приложения) и поменять местами.
 
     Скачанное нами не получает отметку «из интернета», поэтому Gatekeeper новую версию не останавливает.
     """
     parent = os.path.dirname(app)
-    tmp = tempfile.mkdtemp(prefix='.vspo-update-', dir=parent)
+    tmp = tempfile.mkdtemp(prefix='.vo_sp-update-', dir=parent)
     try:
-        z = os.path.join(tmp, 'VSPO.zip')
+        z = os.path.join(tmp, 'VO_SP.zip')
         with open(z, 'wb') as f:
             f.write(data)
         r = subprocess.run(['ditto', '-x', '-k', z, tmp], capture_output=True, text=True, timeout=300)
-        new = os.path.join(tmp, 'VSPO.app')
+        new = os.path.join(tmp, 'VO_SP.app')
         if r.returncode != 0 or not os.path.isdir(new):
-            raise RuntimeError('could not unpack the update: ' + (last_line(r.stderr) or 'no VSPO.app inside'))
+            raise RuntimeError('could not unpack the update: ' + (last_line(r.stderr) or 'no VO_SP.app inside'))
         old = app + '.old'
         if os.path.exists(old):
             shutil.rmtree(old, ignore_errors=True)
@@ -2594,7 +2594,7 @@ def restart(dst=''):
 
 
 def cleanup_old():
-    """После обновления остаётся VSPO.exe.old (Windows) или VSPO.app.old (macOS): старый процесс к этому времени вышел."""
+    """После обновления остаётся VO_SP.exe.old (Windows) или VO_SP.app.old (macOS): старый процесс к этому времени вышел."""
     kind = install_kind()
     if kind not in ('exe', 'app'):
         return
@@ -3029,7 +3029,7 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VSPO</title>
+<title>VO SP</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%237c5cff'/%3E%3Cstop offset='1' stop-color='%231eaaff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='3' y='3' width='58' height='58' rx='14' fill='url(%23g)'/%3E%3Ccircle cx='32' cy='32' r='19' fill='%23fff'/%3E%3Cpath d='M26 22v20l16-10z' fill='%235476ff'/%3E%3C/svg%3E">
 <style>
 :root{color-scheme:dark;--bg:#111217;--panel:#17191f;--cell:#1c1f27;--cellh:#232733;--well:#0a0b0e;--line:#272a34;--line2:#363a47;
@@ -3274,7 +3274,7 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
 </head>
 <body>
 <header>
-  <span id="logo"><svg viewBox="0 0 64 64" aria-hidden="true"><defs><linearGradient id="lg" x2="0" y2="1"><stop offset="0" stop-color="#7c5cff"/><stop offset="1" stop-color="#1eaaff"/></linearGradient></defs><rect x="3" y="3" width="58" height="58" rx="14" fill="url(#lg)"/><circle cx="32" cy="32" r="19" fill="#fff"/><path d="M26 22v20l16-10z" fill="#5476ff"/></svg>VSPO</span>
+  <span id="logo"><svg viewBox="0 0 64 64" aria-hidden="true"><defs><linearGradient id="lg" x2="0" y2="1"><stop offset="0" stop-color="#7c5cff"/><stop offset="1" stop-color="#1eaaff"/></linearGradient></defs><rect x="3" y="3" width="58" height="58" rx="14" fill="url(#lg)"/><circle cx="32" cy="32" r="19" fill="#fff"/><path d="M26 22v20l16-10z" fill="#5476ff"/></svg>VO SP</span>
   <button id="rootb" title="Open another folder"></button>
   <div id="tabs">
     <button id="tab-p" class="tab on">Previews <span id="np" class="n"></span></button>
@@ -3296,7 +3296,7 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
   <button id="tg" title="Show or hide the folder tree">Folders</button>
   <button id="redo" class="op" hidden title="Replace the previews in this folder with new ones: grid, size and look come from the launch options. Old previews go to _to_delete"></button>
   <button id="orph" class="op" hidden title="Previews that have no video (marked &quot;no video&quot; on the tile) will be moved to _to_delete. Ctrl+Z brings them back"></button>
-  <button id="donb" class="ib sp" title="Support VSPO"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 21s-7.5-4.6-9.6-9.2C1 8.6 3 5 6.6 5c2.1 0 3.6 1.1 5.4 3 1.8-1.9 3.3-3 5.4-3C21 5 23 8.6 21.6 11.8 19.5 16.4 12 21 12 21z"/></svg>Support</button>
+  <button id="donb" class="ib sp" title="Support VO SP"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 21s-7.5-4.6-9.6-9.2C1 8.6 3 5 6.6 5c2.1 0 3.6 1.1 5.4 3 1.8-1.9 3.3-3 5.4-3C21 5 23 8.6 21.6 11.8 19.5 16.4 12 21 12 21z"/></svg>Support</button>
   <button id="menub" class="ib" title="Menu: updates, keyboard shortcuts, about"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
   <div id="selbar" class="op" hidden>
     <span id="selcnt"></span>
@@ -3436,8 +3436,8 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
 </div>
 <div id="ov" hidden>
   <div id="donp" class="sheet" hidden>
-    <h2>Support VSPO</h2>
-    <p class="dim">VSPO is free and open source. If it saves you time, you can support its development: every donation helps.</p>
+    <h2>Support VO SP</h2>
+    <p class="dim">VO SP is free and open source. If it saves you time, you can support its development: every donation helps.</p>
     <div class="don">
       <div class="dl">
         <button data-link="monobank"><span class="ic" style="background:#1d1d1d;border:1px solid #444">m</span><span><b>Monobank</b><span>Card of any bank</span></span></button>
@@ -4870,7 +4870,7 @@ function rootStat() {
   const b = $('#rootb');
   b.textContent = 'Folder: ' + (ROOT || '—') + ' ▾';
   b.title = 'Current folder: ' + ROOT_PATH + '. Click to open another one';
-  document.title = 'VSPO' + (ROOT ? ' — ' + ROOT : '');
+  document.title = 'VO SP' + (ROOT ? ' — ' + ROOT : '');
 }
 $('#rootb').onclick = () => {
   const p = $('#rootp');
@@ -5377,19 +5377,19 @@ $('#donp .dl').onclick = e => {
 };
 
 function updStat() {
-  $('#mver').textContent = 'VSPO v' + upd.version;
+  $('#mver').textContent = 'VO SP v' + upd.version;
   $('#menub').classList.toggle('upd', !!upd.newer);
   $('#mupdt').innerHTML = upd.newer ? 'Update to ' + esc(upd.latest) + '<span class="badge">new</span>' : 'Check for updates';
   if ($('#updp').hidden) return;
   const pct = upd.total ? Math.round(100 * upd.done / upd.total) : 0;
-  $('#updh').textContent = upd.newer ? 'VSPO ' + upd.latest + ' is available' : 'Updates';
+  $('#updh').textContent = upd.newer ? 'VO SP ' + upd.latest + ' is available' : 'Updates';
   $('#updt').textContent = upd.running
     ? (upd.stage === 'downloading' ? 'Downloading… ' + pct + '%' + (upd.total ? ' of ' + fmtSize(upd.total) : '')
-      : upd.stage === 'installing' ? 'Installing…' : 'Restarting VSPO…')
+      : upd.stage === 'installing' ? 'Installing…' : 'Restarting VO SP…')
     : upd.checking ? 'Checking GitHub…'
     : upd.error ? 'Update failed: ' + upd.error
     : upd.newer && !upd.kind ? 'You have v' + upd.version + '. This build cannot update itself: download the new version from the release page.'
-    : upd.newer ? 'You have v' + upd.version + '. The new version will be downloaded from GitHub, then VSPO restarts with the same folder.'
+    : upd.newer ? 'You have v' + upd.version + '. The new version will be downloaded from GitHub, then VO SP restarts with the same folder.'
     : upd.latest ? 'You have the latest version, v' + upd.version + '.' : 'You have v' + upd.version + '.';
   $('#updn').textContent = upd.notes || '';
   $('#updn').hidden = !upd.newer || !upd.notes || upd.running;
@@ -5402,7 +5402,7 @@ function updStat() {
 async function updTick() {
   updTimer = 0;
   try { upd = await api('/api/update'); } catch (_) {
-    if (upd.stage === 'restarting') { $('#updt').textContent = 'VSPO has restarted in a new window. This one can be closed.'; return; }
+    if (upd.stage === 'restarting') { $('#updt').textContent = 'VO SP has restarted in a new window. This one can be closed.'; return; }
   }
   updStat();
   if (upd.running || upd.checking) updTimer = setTimeout(updTick, 500);
@@ -5517,7 +5517,7 @@ def main():
     global ROOT_NAME, VROOT, PROOT
     setup_log()
     fix_env()
-    ap = argparse.ArgumentParser(description=APP + ' (Video Streams Preview Organizer): browse previews, delete videos, '
+    ap = argparse.ArgumentParser(description=APP + ' (Video Organizer: Streams Preview): browse previews, delete videos, '
                                              'create previews, play in a video player.')
     ap.add_argument('--version', action='version', version='%s %s' % (APP, VERSION))
     ap.add_argument('folder', nargs='?',

@@ -1,6 +1,6 @@
-"""Рисует иконку VSPO: лист превью (сетка кадров) с кнопкой воспроизведения. Нужен Pillow (только для разработки).
+"""Рисует иконку VO SP: лист превью (сетка кадров) с кнопкой воспроизведения. Нужен Pillow (только для разработки).
 
-    python assets/make_icon.py   ->  assets/vspo.ico, assets/vspo.png
+    python assets/make_icon.py   ->  assets/vo_sp.ico, assets/vo_sp.png
 """
 import os
 
@@ -48,5 +48,5 @@ def draw(size):
 if __name__ == '__main__':
     sizes = [16, 20, 24, 32, 40, 48, 64, 128, 256]
     imgs = [draw(s) for s in sizes]
-    imgs[-1].save(os.path.join(HERE, 'vspo.ico'), sizes=[(s, s) for s in sizes], append_images=imgs[:-1])
-    draw(512).save(os.path.join(HERE, 'vspo.png'))
+    imgs[-1].save(os.path.join(HERE, 'vo_sp.ico'), sizes=[(s, s) for s in sizes], append_images=imgs[:-1])
+    draw(512).save(os.path.join(HERE, 'vo_sp.png'))

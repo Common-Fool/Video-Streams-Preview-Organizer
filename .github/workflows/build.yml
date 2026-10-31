@@ -30,15 +30,15 @@ jobs:
       - name: Check syntax
         run: python -m py_compile pairview.py
 
-      - name: Build VSPO.exe
+      - name: Build VO_SP.exe
         run: >
-          pyinstaller --onefile --noconsole --name VSPO --icon assets/vspo.ico
+          pyinstaller --onefile --noconsole --name VO_SP --icon assets/vo_sp.ico
           --collect-all webview --collect-all pythonnet --collect-all clr_loader pairview.py
 
       - uses: actions/upload-artifact@v7
         with:
-          name: VSPO-windows
-          path: dist/VSPO.exe
+          name: VO_SP-windows
+          path: dist/VO_SP.exe
 
   macos:
     runs-on: macos-latest  # Apple Silicon (arm64)
@@ -52,19 +52,19 @@ jobs:
       - name: Install PyInstaller, pywebview and Pillow (Pillow makes .icns from the PNG icon)
         run: python -m pip install --upgrade pip pyinstaller pywebview pillow
 
-      - name: Build VSPO.app
+      - name: Build VO_SP.app
         run: >
-          pyinstaller --windowed --name VSPO --icon assets/vspo.png
-          --osx-bundle-identifier io.github.common-fool.vspo --collect-all webview pairview.py
+          pyinstaller --windowed --name VO_SP --icon assets/vo_sp.png
+          --osx-bundle-identifier io.github.common-fool.vo-sp --collect-all webview pairview.py
 
-      - name: Pack VSPO-mac.zip
+      - name: Pack VO_SP-mac.zip
         # ditto сохраняет права и символические ссылки внутри .app (обычный zip их теряет)
-        run: ditto -c -k --keepParent dist/VSPO.app VSPO-mac.zip
+        run: ditto -c -k --keepParent dist/VO_SP.app VO_SP-mac.zip
 
       - uses: actions/upload-artifact@v7
         with:
-          name: VSPO-macos
-          path: VSPO-mac.zip
+          name: VO_SP-macos
+          path: VO_SP-mac.zip
 
   linux:
     runs-on: ubuntu-22.04  # старая glibc: AppImage запустится и на дистрибутивах постарше
@@ -83,26 +83,26 @@ jobs:
 
       # без pywebview: WebKitGTK внутрь AppImage толком не упаковывается, AppImage открывает галерею в браузере
       - name: Build
-        run: pyinstaller --onedir --name VSPO pairview.py
+        run: pyinstaller --onedir --name VO_SP pairview.py
 
-      - name: Pack VSPO-x86_64.AppImage
+      - name: Pack VO_SP-x86_64.AppImage
         run: |
           mkdir -p AppDir/usr/lib
-          cp -r dist/VSPO AppDir/usr/lib/vspo
-          printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/lib/vspo/VSPO" "$@"\n' > AppDir/AppRun
+          cp -r dist/VO_SP AppDir/usr/lib/vo_sp
+          printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/lib/vo_sp/VO_SP" "$@"\n' > AppDir/AppRun
           chmod +x AppDir/AppRun
-          printf '[Desktop Entry]\nType=Application\nName=VSPO\nComment=Video Streams Preview Organizer\nExec=VSPO\nIcon=vspo\nCategories=AudioVideo;Video;\nTerminal=false\n' > AppDir/vspo.desktop
-          cp assets/vspo.png AppDir/vspo.png
-          cp assets/vspo.png AppDir/.DirIcon
+          printf '[Desktop Entry]\nType=Application\nName=VO SP\nComment=Video Organizer: Streams Preview\nExec=VO_SP\nIcon=vo_sp\nCategories=AudioVideo;Video;\nTerminal=false\n' > AppDir/vo_sp.desktop
+          cp assets/vo_sp.png AppDir/vo_sp.png
+          cp assets/vo_sp.png AppDir/.DirIcon
           wget -q https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
           echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool-x86_64.AppImage" | sha256sum -c -
           chmod +x appimagetool-x86_64.AppImage
-          ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run AppDir VSPO-x86_64.AppImage
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run AppDir VO_SP-x86_64.AppImage
 
       - uses: actions/upload-artifact@v7
         with:
-          name: VSPO-linux
-          path: VSPO-x86_64.AppImage
+          name: VO_SP-linux
+          path: VO_SP-x86_64.AppImage
 
   release:
     needs: [windows, macos, linux]
@@ -142,10 +142,10 @@ jobs:
         with:
           tag_name: ${{ inputs.release || github.ref_name }}
           target_commitish: ${{ github.sha }}
-          name: VSPO ${{ inputs.release || github.ref_name }}
+          name: VO SP ${{ inputs.release || github.ref_name }}
           body_path: notes.md  # текст релиза показывает встроенное обновление (☰ → Update)
           generate_release_notes: true  # добавит ссылку на полный список изменений
           files: |
-            dist/VSPO-windows/VSPO.exe
-            dist/VSPO-macos/VSPO-mac.zip
-            dist/VSPO-linux/VSPO-x86_64.AppImage
+            dist/VO_SP-windows/VO_SP.exe
+            dist/VO_SP-macos/VO_SP-mac.zip
+            dist/VO_SP-linux/VO_SP-x86_64.AppImage
