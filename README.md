@@ -2,6 +2,8 @@
 
 # VO SP — Video Organizer: Streams Preview
 
+📢 Updates and new projects: [Telegram channel](https://t.me/common_fool)
+
 A desktop tool for Windows, macOS and Linux for browsing, cleaning up and trimming large video collections (stream recordings, archives on a NAS) through their **contact sheets** — preview images with a grid of timestamped frames.
 
 It walks a folder and its subfolders, matches every video with its preview image by name, and shows the previews as a gallery. From there you can delete videos (together with their previews), generate missing previews with ffmpeg, trim videos losslessly, and send videos to your video player — without opening each file.
