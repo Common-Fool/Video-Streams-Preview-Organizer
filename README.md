@@ -12,14 +12,15 @@ The whole program is a single Python file (`pairview.py`, standard library only)
 
 ## Features
 
-- **Gallery of previews.** Matches `clip.mp4` with `clip.jpg` (or `clip.mp4.jpg`) in the same subfolder. Folder tree with counters, sorting, adjustable tile size, full-screen viewer, keyboard navigation that crosses folder boundaries.
+- **Gallery of previews.** Matches `clip.mp4` with `clip.jpg` (or `clip.mp4.jpg`) in the same subfolder. Collapsible folder tree with counts and sizes, sorted by name, last change, size or count; breadcrumbs; adjustable tile size; full-screen viewer; keyboard navigation that crosses folder boundaries in the tree's order.
 - **Safe deletion.** "Delete" never erases anything: the video and its preview are moved (renamed, never copied) into `_to_delete` inside the root folder (an old `_на_удаление` folder from earlier versions is treated the same way). `Ctrl+Z` brings them back. Permanent deletion is a separate, explicit action. Works for single videos, selections, whole folders and empty folders.
 - **Preview generation.** Creates missing contact sheets with ffmpeg: a 10×9 grid, 2560 px wide, with an `HH:MM:SS` timestamp on every frame (vertical and short videos get adapted grids). Frames are grabbed in batches of ~30 per ffmpeg run, because launching ffmpeg on Windows is expensive. Several videos are processed in parallel; the queue can be stopped at any time.
-- **Lossless trimming.** In the viewer, press `C` to open a timeline under the preview. Mark parts to remove — the beginning, the end, or any number of pieces in the middle — by dragging on the timeline or with `I`/`O` at the cursor. Hovering the timeline instantly shows the matching frame from the contact sheet, then the exact frame from ffmpeg. The video is cut with stream copy (no re-encoding, seconds even for long files); each kept piece starts at the nearest earlier keyframe, so nothing you keep is lost. The original goes to `_to_delete`, the trimmed file takes its place, the preview is regenerated, and `Ctrl+Z` restores the original together with the old preview.
+- **Lossless trimming.** In the viewer, press `C` to open a timeline under the preview. Mark parts to remove — the beginning, the end, or any number of pieces in the middle — by dragging on the timeline or with `I`/`O` at the cursor; or drag over the part to keep and press `K`. Trims of several videos wait in a queue and run one after another in the background. Hovering the timeline instantly shows the matching frame from the contact sheet, then the exact frame from ffmpeg. The video is cut with stream copy (no re-encoding, seconds even for long files); each kept piece starts at the nearest earlier keyframe, so nothing you keep is lost. The original goes to `_to_delete`, the trimmed file takes its place, the preview is regenerated, and `Ctrl+Z` restores the original together with the old preview.
 
   ![Trimming: two pieces marked in red on the timeline, a frame preview pops up over the contact sheet](assets/screenshot-trim.jpg)
 
-- **Video player.** Play a folder, a selection or a single video in the player of your choice (menu ☰ → Video player: installed players are detected — MPC-HC, MPC-BE, VLC, PotPlayer, mpv, IINA, Celluloid…, or any program). MPC-HC is recommended on Windows: only with it videos can be appended to the playlist without starting playback, and the player window is brought to the front. Show any file in Explorer / Finder / the file manager.
+- **Built-in player.** Videos play right in the viewer: seek bar with a frame from the contact sheet (then the exact frame), a strip of frames (`T`), speed, frame stepping, autoplay, next video at the end, loop, and playback resumes where you stopped.
+- **External player.** Play a folder, a selection or a single video in the player of your choice (menu ☰ → Video player: installed players are detected — MPC-HC, MPC-BE, VLC, PotPlayer, mpv, IINA, Celluloid…, or any program). MPC-HC is recommended on Windows: only with it videos can be appended to the playlist without starting playback, and the player window is brought to the front. Show any file in Explorer / Finder / the file manager.
 - **Folder switching.** The last opened folder reopens automatically; another one can be picked from the header (recent folders or a folder dialog) without restarting.
 - **Updates from GitHub.** The menu (☰) checks for a new release; one click downloads it, replaces the program (exe, app or AppImage) and restarts VO SP with the same folder. A green dot on the menu button means an update is available.
 - **Network-friendly.** Built for videos on an SMB share: no repeated directory walks in request handlers, the trash counter is kept in memory, preview images are read once and closed immediately.
@@ -82,9 +83,11 @@ Persistent options can be put into `pairview.json` next to the program or in `%A
 
 | Where | Keys |
 |---|---|
-| Gallery | Arrows, `Home`/`End` — select; `Space` — full screen; `Enter` — open video; `E` — show in Explorer / Finder; `Del` — delete video(s); `[` `]` `PgUp` `PgDn` — previous/next folder; `X`, `Ctrl+A` — select tiles; `Ctrl+Z` — undo; `F5` — rescan |
-| Viewer | `←`/`→` — previous/next; `C` — trim video; `I` — hide the bottom bar; `Esc`/`Space` — close |
-| Trimming | `←`/`→` — move cursor 1 s (`Shift` 10 s, `Ctrl` 1 min); `I`/`O` — start/end of a piece to remove; `Del` — unmark the selected piece; `Esc` — close |
+| Gallery | Arrows, `Home`/`End` — select; `Enter`/`Space` — open the preview sheet; `E` — show in Explorer / Finder; `Del` — delete video(s); `Backspace` — parent folder; `[` `]` — folder of the same level; `PgUp` `PgDn` — previous/next folder with videos; `X`, `Ctrl+A` — select tiles; `Ctrl+Z` — undo; `F5` — rescan |
+| Folder tree | Click a folder, then `↑`/`↓` — move, `←`/`→` — collapse/expand, `Del` — delete the folder, `Esc` — back to the gallery |
+| Viewer | `←`/`→` — previous/next; `Space`/`Enter`/`P` — play the video here; `C` — trim; `I` — hide the bar; `Esc` — close |
+| Playing | `Space` — pause; `Shift`/`Ctrl`+`←`/`→` — seek 5 s / 30 s; `↑`/`↓` — volume; `T` — frame strip; `,` `.` — frame step; `P`/`Esc` — back to the sheet |
+| Trimming | `←`/`→` — move cursor 1 s (`Shift` 10 s, `Ctrl` 1 min); `I`/`O` — start/end of a piece to remove; `K` — trim now, keeping only the selected piece; `Del` — unmark the selected piece; `Esc` — close |
 
 ## Building
 

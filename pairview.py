@@ -27,6 +27,7 @@ The folder from pairview.json is used only if the folder from the last run is mi
 Standard library only, Python 3.8+.
 """
 import argparse
+from collections import OrderedDict
 import atexit
 import errno
 import json
@@ -252,7 +253,7 @@ def delete_group(gid):
         g = GROUPS.get(gid)
     if g is None:
         raise Gone('this video is already gone — the list has been refreshed')
-    if trimming() == gid:
+    if gid in trim_busy():
         raise Fail(TRIM_BUSY, 409)
     moved = []
     for path, root, *_ in g['v'] + g['p']:  # видео первым: его чаще держит плеер
@@ -290,7 +291,7 @@ def delete_batch(ids, orphans_only=False):
     for gid, g in todo:
         # спрашиваем на каждой паре: обрезку могли запустить, пока переносились предыдущие. Если её запустят прямо сейчас,
         # данные не пострадают: cut_worker перед заменой проверит, что пара на месте, иначе оставит всё как было
-        if gid == trimming():
+        if gid in trim_busy():
             failed.append({'name': g['name'], 'error': TRIM_BUSY})
             continue
         moved = []
@@ -332,8 +333,8 @@ def undo_last():
         with JLOCK:
             if JOB['running']:
                 raise Fail('wait until preview creation finishes', 409)
-    busy = trimming()
-    if busy is not None and any(rec[0] == busy for rec in batch):  # прошлая обрезка того же видео, которое режется сейчас
+    busy = trim_busy()
+    if any(rec[0] in busy for rec in batch):  # прошлая обрезка того же видео, которое режется или ждёт в очереди
         raise Fail(TRIM_BUSY, 409)
     first = None
     for rec in batch:
@@ -398,7 +399,7 @@ def _rescan():
         by_key = {g.get('key'): gid for gid, g in GROUPS.items()}
         with JLOCK:
             busy = set(JOB['active'])  # этими парами сейчас занят ffmpeg — их превью допишет сам процесс
-        busy.add(trimming())  # и обрезаемой: посреди замены файла обход увидел бы пару без видео
+        busy |= trim_busy()  # и обрезаемой/ждущей обрезки: посреди замены файла обход увидел бы пару без видео
         for key, ng in fresh.items():
             gid = by_key.get(key)
             if gid is None:
@@ -692,6 +693,9 @@ def listing():
             items.append({'id': gid, 'name': g['name'], 'dir': g['dir'], 'nv': len(vs),
                           'size': sum(f[2] for f in vs),
                           'mtime': max(f[3] for f in (vs or ps)), 'pm': max(f[3] for f in ps)})
+            saved = pos_get(vs[0]) if len(vs) == 1 else None
+            if saved:
+                items[-1].update(pos=saved[0], dur=saved[1])
         elif vs:
             videos.append({'id': gid, 'name': g['name'], 'file': os.path.basename(vs[0][0]),
                            'dir': g['dir'], 'size': sum(f[2] for f in vs), 'mtime': vs[0][3]})
@@ -791,6 +795,211 @@ def write_all_settings(d):
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(d, f, ensure_ascii=False, indent=1)
     os.replace(tmp, settings_file())
+
+
+# ───────────────────────── позиции просмотра ─────────────────────────
+
+POS = None  # загружаются один раз, при первом обращении
+POS_LOCK = threading.RLock()
+POS_TIMER = None
+POS_DIRTY = False
+POS_MAX = 20000
+
+
+def pos_number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v < float('inf')
+
+
+def pos_key(path):
+    return os.path.normcase(os.path.abspath(path))
+
+
+def pos_load():
+    global POS
+    with POS_LOCK:
+        if POS is None:
+            try:
+                with open(os.path.join(app_dir(), 'positions.json'), encoding='utf-8') as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                data = {}
+            POS = {pos_key(k): v for k, v in data.items()
+                   if isinstance(k, str) and isinstance(v, list) and len(v) == 5 and
+                   all(pos_number(n) for n in v)} if isinstance(data, dict) else {}
+            pos_limit()
+        return POS
+
+
+def pos_limit():
+    if len(POS) > POS_MAX:
+        for key in sorted(POS, key=lambda k: POS[k][4])[:len(POS) - POS_MAX]:
+            del POS[key]
+
+
+def pos_later():
+    global POS_TIMER, POS_DIRTY
+    POS_DIRTY = True
+    if POS_TIMER is None:
+        POS_TIMER = threading.Timer(3, pos_flush)
+        POS_TIMER.daemon = True
+        POS_TIMER.start()
+
+
+def pos_flush():
+    global POS_TIMER, POS_DIRTY
+    with POS_LOCK:
+        if POS_TIMER is not None:
+            POS_TIMER.cancel()
+            POS_TIMER = None
+        if POS is None or not POS_DIRTY:
+            return
+        try:
+            os.makedirs(app_dir(), exist_ok=True)
+            path = os.path.join(app_dir(), 'positions.json')
+            with open(path + '.tmp', 'w', encoding='utf-8') as f:
+                json.dump(POS, f, ensure_ascii=False, allow_nan=False)
+            os.replace(path + '.tmp', path)
+            POS_DIRTY = False
+        except OSError as e:
+            print('Could not save positions:', e)
+
+
+atexit.register(pos_flush)
+
+
+def pos_get(video):
+    with POS_LOCK:
+        data = pos_load()
+        key = pos_key(video[0])
+        saved = data.get(key)
+        if saved and (saved[2] != video[2] or saved[3] != video[3]):
+            del data[key]
+            pos_later()
+            return None
+        return saved
+
+
+def progress(body):
+    gid, pos, dur = body.get('id'), body.get('pos'), body.get('dur')
+    if not isinstance(gid, int) or isinstance(gid, bool) or not pos_number(pos) or not pos_number(dur):
+        raise Fail('bad progress')
+    with LOCK:
+        g = GROUPS.get(gid)
+        if not g or len(g['v']) != 1:
+            raise Fail('progress requires exactly one video')
+        video = g['v'][0]
+        with POS_LOCK:
+            data = pos_load()
+            key = pos_key(video[0])
+            completed = pos >= dur - 5
+            if pos < 10 and not completed:
+                data.pop(key, None)
+            else:
+                if completed:
+                    pos = dur
+                data[key] = [pos, dur, video[2], video[3], time.time()]
+                pos_limit()
+            pos_later()
+    return {'ok': True}
+
+
+# ───────────────────────── предзагрузка видео ─────────────────────────
+
+PF_HEAD = 2 * 1024 * 1024
+PF_TAIL = 1024 * 1024
+PF_FILES = 8
+
+
+class Prefetch:
+    """Начало и конец нескольких видео; читает одна фоновая нить."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._items = OrderedDict()
+        self._queue = OrderedDict()
+        self._thread = None
+
+    def request(self, key, path):
+        with self._lock:
+            if key in self._items:
+                self._items.move_to_end(key)
+                return
+            self._queue[key] = path
+            self._queue.move_to_end(key)
+            while len(self._queue) > PF_FILES:
+                self._queue.popitem(last=False)
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._main, name='pairview-prefetch', daemon=True)
+                self._thread.start()
+            self._cv.notify()
+
+    def chunk(self, key, a):
+        with self._lock:
+            parts = self._items.get(key)
+            if parts is None:
+                return None
+            self._items.move_to_end(key)
+        for off, data in parts:
+            if off <= a < off + len(data):
+                return off, data
+        return None
+
+    def _main(self):
+        while True:
+            with self._lock:
+                if not self._queue:
+                    self._cv.wait(60)
+                    if not self._queue:
+                        self._thread = None
+                        return
+                key, path = self._queue.popitem(last=True)
+            try:
+                parts = self._read(path, key[1], key[2])
+            except OSError as e:
+                print('Prefetch failed:', path, e)
+                parts = None
+            if parts:
+                with self._lock:
+                    self._items[key] = parts
+                    self._items.move_to_end(key)
+                    while len(self._items) > PF_FILES:
+                        self._items.popitem(last=False)
+
+    @staticmethod
+    def _read(path, size, mtime):
+        with open(lp(path), 'rb') as f:
+            st = os.fstat(f.fileno())
+            if st.st_size != size or st.st_mtime != mtime or size <= 0:
+                return None
+            head = f.read(min(size, PF_HEAD))
+            parts = [(0, head)] if head else []
+            if size > len(head):
+                off = max(len(head), size - PF_TAIL)
+                f.seek(off)
+                tail = f.read(size - off)
+                if len(tail) == size - off:
+                    parts.append((off, tail))
+            after = os.fstat(f.fileno())
+            if after.st_size != size or after.st_mtime != mtime:
+                return None
+            return parts
+
+
+PREFETCH = Prefetch()
+
+
+def prefetch(body):
+    gid = body.get('id')
+    if not isinstance(gid, int) or isinstance(gid, bool):
+        raise Fail('bad id')
+    with LOCK:
+        g = GROUPS.get(gid)
+        if not g or not g['v']:
+            raise Fail('no video')
+        path, _root, size, mtime = g['v'][0]
+    PREFETCH.request((path, size, mtime), path)
+    return {'ok': True}
 
 
 def root_key():
@@ -973,7 +1182,18 @@ def save_player(path):
 
 
 def player_info():
-    return {'ok': True, 'name': PLAYER['name'], 'path': PLAYER['path'], 'add': PLAYER['kind'] == 'mpc', 'os': OS_NAME}
+    return {'ok': True, 'name': PLAYER['name'], 'path': PLAYER['path'], 'add': PLAYER['kind'] == 'mpc',
+            'os': OS_NAME, 'external': read_all_settings().get('player_mode') == 'external'}
+
+
+def set_player_mode(external):
+    if not isinstance(external, bool):
+        raise Fail('external must be a boolean')
+    with SLOCK:
+        d = read_all_settings()
+        d['player_mode'] = 'external' if external else 'builtin'
+        write_all_settings(d)
+    return player_info()
 
 
 def players_menu():
@@ -1366,13 +1586,13 @@ def delete_folder(rel):
         running = JOB['running']
     if running:
         raise Fail('previews are being created: stop it or wait until it finishes, then delete folders', 409)
-    busy = trimming()
-    if busy is not None:
+    busy = trim_busy()
+    if busy:
+        r = os.path.normcase(rel)  # в Windows Folder и folder — одна папка
         with LOCK:
-            g = GROUPS.get(busy)
-        d, r = os.path.normcase(g['dir']) if g else '', os.path.normcase(rel)  # в Windows Folder и folder — одна папка
-        if g and (d == r or d.startswith(r + '/')):
-            raise Fail('a video in this folder is being trimmed: wait until it finishes', 409)
+            dirs = [os.path.normcase(GROUPS[i]['dir']) for i in busy if i in GROUPS]
+        if any(d == r or d.startswith(r + os.path.normcase('/')) for d in dirs):  # normcase в Windows меняет / на \\
+            raise Fail('a video in this folder is being trimmed or waits in the trimming queue: wait or stop it', 409)
     pairs = trash_folder(rel)
     if not pairs:
         raise Fail('folder not found on disk: ' + rel)
@@ -1851,7 +2071,8 @@ def finish(threads, work):
     print('Preview creation %s: created %d, errors %d' % ('stopped' if STOP.is_set() else 'finished', ok, failed))
 
 
-def start_job(ids, redo=False):
+def start_job(ids, redo=False, internal=False):
+    """internal=True — превью после обрезки: его зовёт очередь обрезки, которая сама ещё «идёт»."""
     if not FF['ok']:
         raise Fail('ffmpeg not found: previews cannot be created. Install ffmpeg or pass --ffmpeg PATH')
     with LOCK:
@@ -1864,8 +2085,8 @@ def start_job(ids, redo=False):
         if JOB['running']:
             raise Fail('preview creation is already running', 409)
         with CLOCK:
-            if CUT['running']:
-                raise Fail('a video is being trimmed: wait until it finishes', 409)
+            if CUT['running'] and not internal:
+                raise Fail('videos are being trimmed: wait until it finishes or stop it', 409)
         JOB.update(running=True, stopped=False, redo=bool(redo), total=len(todo), done=0, ok=0,
                    failed={}, active={}, started=time.time())
     STOP.clear()
@@ -1918,7 +2139,10 @@ def job_status():
 # результат пишется рядом как .part и проверяется по длительности; только потом оригинал уходит в _на_удаление,
 # а обрезанный файл встаёт на его место. Ctrl+Z возвращает оригинал и прежнее превью.
 
-CUT = {'running': False, 'id': None, 'name': '', 'stage': '', 'pct': 0, 'error': '', 'note': '', 'stopped': False}
+# running — очередь работает (в том числе ждёт создания превью); id/name/stage/pct/stopped — текущая обрезка;
+# seq/last — итоги готовых обрезок по порядку (страница показывает каждый один раз)
+CUT = {'running': False, 'id': None, 'name': '', 'stage': '', 'pct': 0, 'stopped': False, 'seq': 0, 'last': []}
+CUTQ = []     # ждущие обрезки: [{'id', 'name', 'regs'}] — режутся по одной, по порядку
 CLOCK = threading.Lock()
 CUTPROC = {'p': None}
 AFTER = {}    # номер пары -> функция(новое превью, [(старое, куда перенесено)]): её вызывает worker после пересоздания
@@ -1926,13 +2150,21 @@ PROBES = {}   # (путь, размер, mtime) -> данные ffprobe: при 
 MUXERS = {'.mp4': 'mp4', '.m4v': 'mp4', '.mov': 'mov', '.mkv': 'matroska', '.webm': 'webm', '.avi': 'avi',
           '.flv': 'flv', '.wmv': 'asf', '.mpg': 'mpeg', '.mpeg': 'mpeg', '.vob': 'vob', '.ts': 'mpegts',
           '.m2ts': 'mpegts', '.3gp': '3gp', '.ogv': 'ogg'}
-TRIM_BUSY = 'this video is being trimmed: wait until it finishes or stop it'
+TRIM_BUSY = 'this video is being trimmed or waits in the trimming queue: wait or stop it'
 
 
-def trimming():
-    """Номер пары, которую сейчас обрезают, или None: её файлы нельзя удалять, пока идёт обрезка."""
+def trim_busy():
+    """Номера пар, которые сейчас обрезают или которые ждут в очереди: их файлы нельзя удалять и возвращать."""
     with CLOCK:
-        return CUT['id'] if CUT['running'] else None
+        s = {t['id'] for t in CUTQ}
+        if CUT['running'] and CUT['id'] is not None:
+            s.add(CUT['id'])
+        return s
+
+
+def cut_stopped():
+    with CLOCK:
+        return CUT['stopped']
 
 
 def ff_call(cmd, capture=True, timeout=60, raw=False):
@@ -2084,34 +2316,45 @@ def cut_plan(video, info, regs):
 
 def cut_status():
     with CLOCK:
-        return dict(CUT)
+        st = dict(CUT)
+        st['last'] = list(CUT['last'])
+        st['queue'] = [{'id': t['id'], 'name': t['name']} for t in CUTQ]
+        return st
 
 
 def cut_start(gid, cuts):
+    """Поставить обрезку в очередь: режется сразу, если очередь пуста, иначе после прошлых."""
     g, video = cut_target(gid)
     fmt = MUXERS.get(os.path.splitext(video)[1].lower())
     if not fmt:
         raise Fail('cannot trim %s files' % os.path.splitext(video)[1])
-    regs = cut_regions(cut_probe(video), cuts)
-    if regs[0][0] <= 0.05 and regs[-1][1] >= cut_probe(video)['duration'] - 0.05 and len(regs) == 1:
+    info = cut_probe(video)
+    regs = cut_regions(info, cuts)
+    if len(regs) == 1 and regs[0][0] <= 0.05 and regs[0][1] >= info['duration'] - 0.05:
         raise Fail('nothing would be left of the video')
-    with JLOCK:
-        if JOB['running']:
-            raise Fail('previews are being created: trim after it finishes', 409)
-        with CLOCK:
-            if CUT['running']:
-                raise Fail('another video is already being trimmed', 409)
-            CUT.update(running=True, id=gid, name=os.path.basename(video), stage='preparing', pct=0,
-                       error='', note='', stopped=False)
-    threading.Thread(target=cut_worker, args=(gid, g, video, fmt, regs), daemon=True).start()
+    with CLOCK:
+        if any(t['id'] == gid for t in CUTQ) or (CUT['running'] and CUT['id'] == gid):
+            raise Fail('this video is already in the trimming queue', 409)
+        CUTQ.append({'id': gid, 'name': os.path.basename(video), 'regs': regs})
+        idle = not CUT['running']
+        if idle:
+            CUT.update(running=True, id=None, name='', stage='', pct=0, stopped=False)
+    if idle:
+        threading.Thread(target=cut_loop, daemon=True).start()
     return cut_status()
 
 
-def cut_stop():
+def cut_stop(gid=None):
+    """Без gid — остановить текущую обрезку и очистить очередь; с gid — только эту (текущую или ждущую)."""
     with CLOCK:
-        if CUT['running']:
+        if gid is None:
+            CUTQ.clear()
+        else:
+            CUTQ[:] = [t for t in CUTQ if t['id'] != gid]
+        cur = CUT['running'] and CUT['id'] is not None and (gid is None or CUT['id'] == gid)
+        if cur:
             CUT['stopped'] = True
-        p = CUTPROC['p']
+        p = CUTPROC['p'] if cur else None
     if p is not None:
         try:
             p.kill()
@@ -2146,11 +2389,11 @@ def cut_run(cmd, total, err_path):
         return rc, ef.read()
 
 
-def cut_worker(gid, g, video, fmt, regs):
+def cut_one(gid, g, video, fmt, regs):
+    """Обрезать одно видео; успех — запись отмены, сбой — Fail. При сбое видео не меняется."""
     work = tempfile.mkdtemp(prefix='pairview_cut_')
     WORKDIRS.add(work)
     part = video + '.part'
-    err = ''
     try:
         info = cut_probe(video)
         with CLOCK:
@@ -2177,7 +2420,7 @@ def cut_worker(gid, g, video, fmt, regs):
                '-progress', 'pipe:1', '-nostats', '-f', fmt, part]
         print('Trimming %s: keeping %s' % (os.path.basename(video), ', '.join('%s–%s' % (hms(a), hms(b)) for a, b in plan)))
         rc, ferr = cut_run(cmd, total, os.path.join(work, 'err.txt'))
-        if cut_status()['stopped']:
+        if cut_stopped():
             raise Fail('trimming stopped, the video is unchanged')
         if rc != 0 or not os.path.exists(lp(part)) or os.path.getsize(lp(part)) == 0:
             raise Fail('ffmpeg could not trim: ' + last_line(ferr))
@@ -2211,10 +2454,7 @@ def cut_worker(gid, g, video, fmt, regs):
             g['v'][:] = [(video, root, s2.st_size, s2.st_mtime)]
             UNDO.append([rec])
         print('Trimmed: %s, was %s, now %s' % (os.path.basename(video), hms(d), hms(new['duration'])))
-    except Fail as e:
-        err = str(e)
-    except Exception as e:  # noqa: BLE001
-        err = '%s: %s' % (type(e).__name__, e)
+        return rec
     finally:
         try:
             if os.path.exists(lp(part)):
@@ -2223,23 +2463,61 @@ def cut_worker(gid, g, video, fmt, regs):
             pass
         shutil.rmtree(work, ignore_errors=True)
         WORKDIRS.discard(work)
-        with CLOCK:
-            CUT.update(running=False, error=err, stage='' if err else 'done')
-    if err:
-        print('Trimming %s: %s' % (os.path.basename(video), err))
-        return
 
-    def after(out, moved):  # старое превью ушло в корзину, новое встало: отмена должна вернуть старое
-        rec[2].extend(moved)
-        rec[3].append((out, PROOT))
 
-    AFTER[gid] = after
-    try:
-        start_job([gid], redo=bool(g['p']))
-    except Fail as e:
-        AFTER.pop(gid, None)
+def cut_loop():
+    """Очередь обрезки, по одной. Обрезка и создание превью не идут вместе: каждая обрезка ждёт, пока создание
+    закончится (в том числе пересоздание превью прошлой обрезки), а новое создание превью, пока очередь не пуста,
+    не начнётся (start_job откажет)."""
+    while True:
         with CLOCK:
-            CUT['note'] = 'the preview was not recreated (%s): use the "Recreate previews" button' % e
+            if not CUTQ:
+                CUT.update(running=False, id=None, name='', stage='', pct=0, stopped=False)
+                return
+            t = CUTQ.pop(0)
+            gid = t['id']
+            CUT.update(id=gid, name=t['name'], stage='waiting for preview creation', pct=0, stopped=False)
+        err = note = ''
+        try:
+            while True:
+                with JLOCK:
+                    busy = JOB['running']
+                if not busy:
+                    break
+                if cut_stopped():
+                    raise Fail('trimming stopped, the video is unchanged')
+                time.sleep(0.3)
+            if cut_stopped():
+                raise Fail('trimming stopped, the video is unchanged')
+            with CLOCK:
+                CUT['stage'] = 'preparing'
+            g, video = cut_target(gid)  # пока ждали, видео могли удалить или переименовать
+            fmt = MUXERS.get(os.path.splitext(video)[1].lower())
+            if not fmt:
+                raise Fail('cannot trim %s files' % os.path.splitext(video)[1])
+            rec = cut_one(gid, g, video, fmt, t['regs'])
+
+            def after(out, moved, rec=rec):  # старое превью ушло в корзину, новое встало: отмена должна вернуть старое
+                rec[2].extend(moved)
+                rec[3].append((out, PROOT))
+
+            AFTER[gid] = after
+            try:
+                start_job([gid], redo=bool(g['p']), internal=True)
+            except Fail as e:
+                AFTER.pop(gid, None)
+                note = 'the preview was not recreated (%s): use the "Recreate previews" button' % e
+        except (Fail, Gone) as e:
+            err = str(e)
+        except Exception as e:  # noqa: BLE001 — одна поломка не должна останавливать очередь
+            err = '%s: %s' % (type(e).__name__, e)
+        if err:
+            print('Trimming %s: %s' % (t['name'], err))
+        with CLOCK:
+            CUT['seq'] += 1
+            CUT['last'] = (CUT['last'] + [{'seq': CUT['seq'], 'id': gid, 'name': t['name'],
+                                           'error': err, 'note': note}])[-20:]
+            CUT.update(id=None, stage='', pct=0)
 
 
 # ───────────────────────── смена открытой папки ─────────────────────────
@@ -2727,8 +3005,10 @@ class Handler(BaseHTTPRequestHandler):
             g = GROUPS.get(gid)
         if not g or not g['v']:
             raise LookupError('no video')
-        path = lp(g['v'][0][0])
+        original = g['v'][0][0]
+        path = lp(original)
         st = os.stat(path)
+        cache_key = (original, st.st_size, st.st_mtime)
         size = st.st_size
         try:
             rng = parse_range(self.headers.get('Range'), size)
@@ -2753,11 +3033,20 @@ class Handler(BaseHTTPRequestHandler):
         pos = a
         while pos <= b:
             try:
-                with open(path, 'rb') as f:
-                    if os.fstat(f.fileno()).st_mtime != st.st_mtime:  # файл заменили (обрезка): не смешивать два файла
+                cached = PREFETCH.chunk(cache_key, pos)
+                if cached:
+                    now = os.stat(path)
+                    if now.st_size != size or now.st_mtime != st.st_mtime:
                         break
-                    f.seek(pos)
-                    chunk = f.read(min(VIDEO_CHUNK, b - pos + 1))
+                    off, data = cached
+                    chunk = data[pos - off:pos - off + min(VIDEO_CHUNK, b - pos + 1)]
+                else:
+                    with open(path, 'rb') as f:
+                        now = os.fstat(f.fileno())
+                        if now.st_size != size or now.st_mtime != st.st_mtime:  # файл заменили: не смешивать версии
+                            break
+                        f.seek(pos)
+                        chunk = f.read(min(VIDEO_CHUNK, b - pos + 1))
             except OSError:
                 break
             if not chunk:
@@ -2835,6 +3124,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.image(int(p[1]))
             elif not post and p[0] == 'v' and len(p) == 2:
                 self.video(int(p[1]))
+            elif post and p == ['api', 'progress']:
+                self.reply(200, progress(self.jbody(raw)))
+            elif post and p == ['api', 'prefetch']:
+                self.reply(200, prefetch(self.jbody(raw)))
             elif not post and p == ['api', 'cut']:
                 self.reply(200, cut_status())
             elif not post and len(p) == 4 and p[:3] == ['api', 'cut', 'frame']:
@@ -2896,11 +3189,13 @@ class Handler(BaseHTTPRequestHandler):
                 b = self.jbody(raw)
                 self.reply(200, cut_start(int(b.get('id', -1)), b.get('cuts')))
             elif post and p == ['api', 'cut', 'stop']:
-                self.reply(200, cut_stop())
+                gid = self.jbody(raw).get('id')
+                self.reply(200, cut_stop(gid if isinstance(gid, int) and not isinstance(gid, bool) else None))
             elif not post and p == ['api', 'player']:
                 self.reply(200, players_menu())
             elif post and p == ['api', 'player', 'set']:
-                self.reply(200, choose_player(self.jbody(raw).get('id')))
+                b = self.jbody(raw)
+                self.reply(200, set_player_mode(b['external']) if 'external' in b else choose_player(b.get('id')))
             elif post and p == ['api', 'player', 'pick']:
                 self.reply(200, pick_player())
             elif post and p == ['api', 'root', 'pick']:
@@ -3069,16 +3364,34 @@ kbd{display:inline-block;min-width:22px;text-align:center;font-family:inherit;fo
 
 #wrap{display:flex;align-items:flex-start}
 main{flex:1;min-width:0}
-#tree{flex:0 0 264px;position:sticky;top:var(--hh);max-height:calc(100vh - var(--hh));overflow:auto;padding:14px 10px 20px 12px;background:var(--panel);border-right:1px solid var(--line);min-height:calc(100vh - var(--hh))}
+#tree{flex:0 0 264px;position:sticky;top:var(--hh);max-height:calc(100vh - var(--hh));overflow:auto;padding:8px 6px 20px;background:var(--panel);border-right:1px solid var(--line);min-height:calc(100vh - var(--hh))}
 body.notree #tree{display:none}
-.deep{margin:0 0 10px;padding:0 8px}
-button.dir{display:flex;width:100%;align-items:center;gap:8px;margin:1px 0;padding:5px 8px;text-align:left;background:none;border:0;border-radius:6px}
-button.dir:hover:not(:disabled){background:#22252e}
-button.dir.on{background:#2a2840;color:#fff;font-weight:600;box-shadow:inset 3px 0 0 var(--acc)}
-button.dir.zero{color:var(--dim)}
-button.dir.on.zero{font-weight:400}
-.dn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dc{font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums}
+#tsh{position:sticky;top:-8px;z-index:2;display:flex;align-items:center;gap:6px;margin:-8px -6px 6px;padding:6px 8px;background:var(--panel);border-bottom:1px solid var(--line);font-size:12px;color:var(--dim)}
+#tsh span{flex:1;text-transform:uppercase;letter-spacing:.05em}
+#tsh select,#tsh button{padding:2px 6px;font-size:12px}
+.deep{display:flex;align-items:center;justify-content:space-between;gap:6px;margin:0 0 6px;padding:0 4px;font-size:13px}
+.deep label{gap:6px}
+.deep button{padding:2px 8px;font-size:12px;white-space:nowrap}
+.tr{display:flex;align-items:center;gap:6px;padding:4px 8px 4px 6px;border-radius:6px;cursor:pointer;white-space:nowrap;user-select:none}
+.tr:hover{background:#22252e}
+.tr.on{background:#2a2840;color:#fff;font-weight:600;box-shadow:inset 3px 0 0 var(--acc)}
+.tr.zero{color:var(--dim)}
+.tr.on.zero{font-weight:400}
+.tr.kf{outline:1px solid var(--pick);outline-offset:-1px}
+.ta{flex:none;position:relative;width:14px;height:14px;color:var(--dim)}
+.ta::before{content:'';position:absolute;left:3px;top:2px;border:solid transparent;border-width:5px 0 5px 7px;border-left-color:currentColor}
+.ta:hover{color:var(--text)}
+.ta.no{visibility:hidden}
+.tr.open>.ta{transform:rotate(90deg)}
+.tnm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.tcn{flex:none;font-size:11px;font-weight:400;color:var(--dim);font-variant-numeric:tabular-nums}
+#crumbs{flex-basis:100%;display:flex;align-items:center;gap:4px;min-width:0;margin-top:-2px;padding-top:4px;border-top:1px solid var(--line);font-size:13px;overflow-x:auto;white-space:nowrap;scrollbar-width:none}
+#crumbs::-webkit-scrollbar{display:none}
+#crumbs .cr{background:none;border:0;padding:2px 7px;color:var(--dim)}
+#crumbs .cr:hover:not(:disabled){background:var(--ctlh);color:var(--text)}
+#crumbs .cur{padding:2px 7px;font-weight:600}
+#crumbs .sep{color:#555a6b}
+#crumbs .xpl{margin-left:auto;flex:none;padding:2px 9px;font-size:12px}
 #empty{margin:0;padding:28px 16px}
 
 #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(var(--w),100%),1fr));gap:16px;padding:18px}
@@ -3091,6 +3404,7 @@ figure.bad,figure.bad.sel{border-color:var(--bad);box-shadow:0 0 0 1px var(--bad
 .err{padding:7px 10px;background:var(--badbg);color:#ffc2bd;font-size:12px;line-height:1.35}
 .im{position:relative;aspect-ratio:16/10;background:var(--well);cursor:zoom-in}
 .im img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+.wb{position:absolute;left:0;bottom:0;height:3px;background:var(--accg);pointer-events:none}
 .nov{position:absolute;right:8px;top:8px;padding:2px 9px;border-radius:20px;background:var(--bad);color:#fff;font-size:12px;font-weight:600}
 figcaption{padding:9px 12px 10px}
 .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
@@ -3099,39 +3413,73 @@ figcaption{padding:9px 12px 10px}
 figure.sel .bt,figure:hover .bt{display:flex}
 .bt button{padding:3px 10px;font-size:12px}
 
-#v{position:fixed;inset:0;z-index:10;display:flex;flex-direction:column;background:var(--well)}
-#v[hidden],#verr[hidden]{display:none}
-#vi{flex:1;min-height:0;width:100%;object-fit:contain}
-#vi[hidden],#vv[hidden],#vpl[hidden],#vfail[hidden],#vpop[hidden]{display:none}
-#vv{flex:1;min-height:0;width:100%;background:#000;outline:none}
-#vfail{position:absolute;left:50%;top:40%;z-index:3;transform:translate(-50%,-50%);padding:18px 22px;border:1px solid var(--line2);border-radius:12px;background:#1a1c23f2;text-align:center}
+#v{position:fixed;inset:0;z-index:10;display:flex;flex-direction:column;background:var(--well);user-select:none}
+#v [hidden],#v[hidden]{display:none!important}
+#vstage{position:relative;flex:1;min-height:0;overflow:hidden}
+#vi,#vv{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000;outline:none}
+#vfail{position:absolute;left:50%;top:40%;z-index:3;transform:translate(-50%,-50%);max-width:calc(100% - 130px);padding:18px 22px;border:1px solid var(--line2);border-radius:12px;background:#1a1c23f2;text-align:center}
 #vfail p{margin:0 0 12px}
-#vpl{padding:4px 16px 6px;background:#14161c;border-top:1px solid var(--line)}
-#vseek{position:relative;height:18px;cursor:pointer;touch-action:none}
+#vmsg{position:absolute;left:50%;top:14%;z-index:4;transform:translateX(-50%);max-width:80%;padding:8px 16px;border-radius:10px;background:#000c;color:#fff;pointer-events:none}
+#vmsg.err{background:#8a2f2b}
+#vmsg.low{top:auto;padding:4px 10px;font-size:13px}
+#vrestart{pointer-events:auto;margin-left:10px;padding:2px 8px;font-size:12px}
+.vnav,#vclose{position:absolute;z-index:3;display:flex;align-items:center;justify-content:center;opacity:0;border:1px solid #ffffff26;background:#000a;color:#fff;transition:opacity .15s}
+.vnav{top:50%;width:48px;height:64px;margin-top:-32px;border-radius:12px;font-size:32px;padding:0 0 4px}
+#vprev{left:14px}
+#vnext{right:14px}
+#vclose{top:14px;right:14px;width:38px;height:38px;border-radius:50%;padding:0;font-size:18px}
+#v:hover .vnav,#v:hover #vclose,#vstage:focus-within .vnav,#vstage:focus-within #vclose{opacity:.75}
+#v .vnav:hover,#v #vclose:hover{opacity:1;background:#000d}
+#vpanelbar{position:relative;flex:none;z-index:3;padding:6px 16px 10px;background:var(--panel);border-top:1px solid var(--line);transition:opacity .2s}
+#v.playing #vpanelbar{position:absolute;left:0;right:0;bottom:0;padding-top:28px;border:0;background:linear-gradient(transparent,#000e 55%);color:#fff}
+#v.playing.idle #vpanelbar,#v.playing.idle .vnav,#v.playing.idle #vclose{opacity:0;pointer-events:none}
+#v.playing.idle,#v.playing.idle #vi,#v.playing.idle #vv{cursor:none}
+body.nobar #vpanelbar{display:none}
+#vtl{position:relative;height:54px;margin:0 0 6px;border-radius:6px;overflow:hidden;background:#ffffff14;cursor:pointer;touch-action:none}
+#vtlc{display:block;width:100%;height:100%}
+#vtlm{position:absolute;top:0;bottom:0;width:2px;margin-left:-1px;background:#fff;box-shadow:0 0 0 1px #0009;pointer-events:none}
+#vtlt{position:absolute;bottom:3px;transform:translateX(-50%);padding:1px 6px;border-radius:5px;background:#000c;color:#fff;font-size:12px;pointer-events:none}
+#vseek{position:relative;height:18px;margin-bottom:4px;cursor:pointer;touch-action:none}
 #vtrack,#vfill{position:absolute;left:0;top:7px;height:4px;border-radius:2px;pointer-events:none}
-#vtrack{right:0;background:#ffffff26}
+#vtrack{right:0;background:#ffffff30}
 #vfill{width:0;background:var(--accg)}
 #vknob{position:absolute;top:3px;left:0;width:12px;height:12px;margin-left:-6px;border-radius:50%;background:#fff;box-shadow:0 0 0 2px #0006;pointer-events:none}
 #vseek:hover #vtrack,#vseek:hover #vfill{top:6px;height:6px}
-#vpop{position:absolute;bottom:20px;z-index:3;padding:4px;border:1px solid var(--line2);border-radius:8px;background:#0c0d11;box-shadow:0 8px 24px #000a;pointer-events:none}
-#vptile{width:240px;background:#000 no-repeat}
-#vptime{display:block;padding-top:3px;text-align:center;font-size:12px;font-variant-numeric:tabular-nums}
-#vprow{display:flex;align-items:center;gap:10px;margin-top:2px}
-#vprow .sp{flex:1}
-#vplay{min-width:40px}
-#vtime{color:var(--dim);font-variant-numeric:tabular-nums}
-#vvol{width:100px}
-body.nobar #vpl{display:none}
-#vb{display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;padding:10px 16px;background:var(--panel);border-top:1px solid var(--line)}
-#vtrim{display:flex;align-items:center;gap:8px;color:var(--acc2);font-size:13px}
-#vtrim[hidden]{display:none}
-#vtrim button{padding:2px 10px;font-size:12px}
-body.nobar #vb{display:none}
-#verr{position:absolute;left:0;right:0;top:0;z-index:2;padding:10px 16px;background:#8a2f2b;color:#fff;font-weight:600}
-#v.wait #vi{opacity:.5}
-body.wait,body.wait *{cursor:progress}
+#vpv{position:fixed;left:0;top:0;z-index:15;padding:4px;border:1px solid var(--line2);border-radius:8px;background:#0c0d11;box-shadow:0 8px 24px #000a;pointer-events:none}
+#vptile{background:#000 no-repeat}
+#vpvc{position:absolute;left:4px;top:4px;display:block}
+#vpvt{display:block;padding-top:3px;text-align:center;color:#fff;font-size:12px;font-variant-numeric:tabular-nums}
+#vrow{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;font-size:13px}
 #vname{flex:1;min-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
 #vmeta{display:flex;gap:12px;color:var(--dim)}
+#vpl{position:relative;display:flex;align-items:center;flex:1 0 100%;gap:8px;min-height:34px}
+#vpl .sp{flex:1;min-width:100px}
+#vpl button{min-width:32px;padding:4px 7px}
+#vplay,#vmute{width:34px;height:32px;display:inline-flex;align-items:center;justify-content:center}
+#vmute svg{width:20px;height:20px}
+#vmute .i-off,#vmute.off .i-on{display:none}
+#vmute.off .i-off{display:block}
+#vtime{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);white-space:nowrap;font-variant-numeric:tabular-nums;pointer-events:none}
+#vrate{min-width:48px!important;font-variant-numeric:tabular-nums}
+#vvol{width:90px}
+#voptions{display:flex;gap:4px}
+#voptions button.on,#vtlb.on{color:var(--acc2);border-color:var(--acc)}
+#vb{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;flex:1 0 100%}
+#vb button{font-size:13px;padding:5px 9px}
+#vtrim{display:flex;align-items:center;gap:8px;color:var(--acc2);font-size:13px;flex:1 0 100%}
+#vtrim button{padding:2px 10px;font-size:12px}
+#vtov{position:fixed;z-index:16;transform:translate(-50%,-50%);padding:3px 10px;border-radius:8px;background:#000b;color:#fff;font-variant-numeric:tabular-nums;pointer-events:none;white-space:nowrap}
+#verr{position:absolute;left:0;right:0;top:0;z-index:4;padding:10px 16px;background:#8a2f2b;color:#fff;font-weight:600}
+#v.wait #vi{opacity:.5}
+body.wait,body.wait *{cursor:progress}
+#plmode{display:flex;flex-direction:column;gap:6px;margin-bottom:16px}
+#plmode button{display:flex;align-items:center;gap:12px;padding:9px 12px;text-align:left;border-radius:10px}
+#plmode button.on{border-color:var(--acc);background:#25223a}
+#plmode .rd{width:16px;height:16px;flex:none;border:2px solid var(--line2);border-radius:50%}
+#plmode button.on .rd{border:5px solid var(--acc)}
+#plmode .pn{flex:1;min-width:0}
+#plmode .pn span{display:block;font-size:12px;color:var(--dim)}
+@media(max-width:800px){#vpl{flex-wrap:wrap}#vpl .sp{min-width:0}#vtime{position:static;transform:none;margin-right:auto}#vvol{width:70px}#voptions{margin-left:auto}}
 #cut{position:relative;padding:12px 16px 8px;background:#14161c;border-top:1px solid var(--line)}
 #ctrack{position:relative;height:46px;border-radius:6px;background:#1f4a3a;cursor:crosshair;touch-action:none;user-select:none}
 .creg{position:absolute;top:0;bottom:0;background:#b8403acc;border-left:2px solid #ff7d74;border-right:2px solid #ff7d74;cursor:pointer}
@@ -3151,7 +3499,7 @@ body.wait,body.wait *{cursor:progress}
 #cimg{position:absolute;left:4px;top:4px;width:320px;visibility:hidden}
 #cimg.on{visibility:visible}
 #ctime{display:block;padding-top:3px;text-align:center;font-size:12px;font-variant-numeric:tabular-nums}
-#v.cutting #prev,#v.cutting #next,#v.cutting #pdir,#v.cutting #ndir,#v.cutting #vdel,#v.cutting #vcut{pointer-events:none;opacity:.4}
+#v.cutting #vprev,#v.cutting #vnext,#v.cutting #vhere,#v.cutting #vdel,#v.cutting #vcut{pointer-events:none;opacity:.4}
 #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:60;max-width:90vw;padding:9px 16px;border-radius:10px;background:#1d2029;border:1px solid var(--line2);box-shadow:0 10px 30px #000a;opacity:0;pointer-events:none}
 body.viewing #toast{bottom:76px}
 #toast.on{opacity:1}
@@ -3180,8 +3528,6 @@ body.mode-v #vl{display:block}
 #vtool{position:sticky;top:var(--hh);z-index:4;display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;padding:12px 0;background:var(--bg);border-bottom:1px solid var(--line)}
 #vsel{margin-right:auto;font-weight:600}
 #vign,#vfmt{margin:10px 0 0;font-size:12px}
-#fact{display:flex;flex-direction:column;gap:6px;margin:0 0 10px;padding:0 4px}
-#fact button{width:100%;text-align:left}
 #dlg,#ov{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;background:#05060acc;backdrop-filter:blur(3px)}
 #dlg .box,.sheet{width:min(540px,calc(100vw - 32px));padding:20px;border:1px solid var(--line2);border-radius:14px;background:#1a1c23;box-shadow:0 20px 60px #000c}
 #dtxt{margin:0 0 18px;line-height:1.55;white-space:pre-line;max-height:60vh;overflow:auto}
@@ -3194,8 +3540,6 @@ figure.pick .pk::after{content:'✓';position:absolute;inset:0;display:flex;alig
 #selbar{flex-basis:100%;display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;padding-top:6px;border-top:1px solid var(--line)}
 #selcnt{margin-right:6px;font-weight:600;color:#8fd0ff}
 #vi{cursor:zoom-out}
-#fact2{display:flex;gap:6px;margin:0 0 12px;padding:0 4px}
-#fact2 button{flex:1;min-width:0;padding:5px 8px;white-space:nowrap;font-size:13px}
 #jobbar,#cutbar{flex-basis:100%;margin-top:-2px}
 .jrow{display:flex;align-items:center;gap:12px;color:var(--dim);font-size:13px}
 .jrow span{flex:1;min-width:0}
@@ -3228,11 +3572,6 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
 #rootl .dim{font-size:12px;word-break:break-all}
 #rootb{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
 #menup{width:280px;padding:6px}
-.prow{display:flex;gap:6px}
-.prow #fplay{flex:1;min-width:0;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#fact .prow button{width:auto}
-#fplr{flex:none;padding:5px 8px}
-#fplr svg{width:16px;height:16px}
 #pll{display:flex;flex-direction:column;gap:6px;margin:0 0 16px;max-height:50vh;overflow:auto}
 #pll button{display:flex;align-items:center;gap:12px;padding:9px 12px;text-align:left;border-radius:10px}
 #pll button.on{border-color:var(--acc);background:#25223a}
@@ -3282,13 +3621,13 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
   </div>
   <span id="cnt"></span>
   <button id="refresh" title="Reread the folder: find new videos and previews, drop missing ones (F5)">Refresh</button>
-  <label class="op" title="Sort order">
+  <label class="op" title="Sort order">Sort
     <select id="srt" aria-label="Sort order">
-      <option value="name">Sort: by name</option>
-      <option value="new">Sort: newest first</option>
-      <option value="old">Sort: oldest first</option>
-      <option value="big">Sort: largest first</option>
+      <option value="name">Name</option>
+      <option value="date">Date</option>
+      <option value="size">Size</option>
     </select>
+    <button id="sdir" title="Ascending / descending">↑</button>
   </label>
   <label class="op" title="Tile size"><svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="3" width="8" height="8" rx="2"/><rect x="3" y="13" width="8" height="8" rx="2"/><rect x="13" y="13" width="8" height="8" rx="2"/></svg><input id="sz" type="range" min="200" max="1600" step="20" aria-label="Tile size"></label>
   <button id="und" class="op" disabled title="Bring back what was deleted last (Ctrl+Z)">Undo</button>
@@ -3314,6 +3653,7 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
     <div class="bar"><i id="cbar"></i></div>
     <div class="jrow"><span id="cptxt"></span><button id="cstop" title="Stop trimming: the video stays unchanged">Stop</button></div>
   </div>
+  <nav id="crumbs" aria-label="Path"></nav>
 </header>
 <div id="rootp" hidden>
   <p>Current folder: <span id="rooti" class="dim"></span></p>
@@ -3343,14 +3683,9 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
 </div>
 <div id="wrap">
   <aside id="tree">
-    <label class="deep"><input type="checkbox" id="deep"> include subfolders</label>
-    <div id="fact">
-      <button id="fexp" title="Open the selected folder in Explorer">Open in Explorer</button>
-      <div class="prow"><button id="fplay">Play</button><button id="fplr" class="ib" title="Choose the video player"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.8-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.8 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.8.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.8V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg></button></div>
-      <button id="fmpc">Add to MPC playlist</button>
-    </div>
-    <div id="fact2">
-      <button id="fdel" class="danger" title="Move the selected folder with everything in it (subfolders and any files) to _to_delete">Delete folder…</button>
+    <div id="tsh"><span>Folders</span><select id="tsrt" aria-label="Sort folders in the tree" title="Sort folders in the tree"><option value="name">Name</option><option value="date">Date</option><option value="size">Size</option><option value="count">Count</option></select><button id="tsdir" title="Ascending / descending">↑</button></div>
+    <div class="deep">
+      <label><input type="checkbox" id="deep"> include subfolders</label>
       <button id="fempty" title="Find folders without files and move them to _to_delete">Empty folders…</button>
     </div>
     <nav id="dirs"></nav>
@@ -3374,21 +3709,17 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
 </div>
 <div id="v" hidden>
   <div id="verr" hidden></div>
-  <img id="vi" alt="">
-  <video id="vv" playsinline preload="none" disablepictureinpicture hidden></video>
-  <div id="vfail" hidden><p>This video can't be played here (format or codec).</p><button id="vfext" class="go">Open in the video player</button></div>
-  <div id="vpl" hidden>
-    <div id="vseek"><div id="vtrack"></div><div id="vfill"></div><div id="vknob"></div>
-      <div id="vpop" hidden><div id="vptile"></div><span id="vptime"></span></div></div>
-    <div id="vprow">
-      <button id="vplay" title="Play / pause (Space)">▶</button>
-      <span id="vtime">0:00 / 0:00</span>
-      <button id="vrate" title="Playback speed (Shift+, and Shift+.)">1×</button>
-      <span class="sp"></span>
-      <button id="vmute" title="Mute (M)">Sound on</button>
-      <input id="vvol" type="range" min="0" max="1" step="0.01" aria-label="Volume (↑ ↓)">
-    </div>
+  <div id="vstage">
+    <img id="vi" alt="" draggable="false">
+    <video id="vv" playsinline preload="none" disablepictureinpicture hidden></video>
+    <div id="vfail" hidden><p>This video can't be played here (format or codec).</p><button id="vfext" class="go">Open in the video player</button></div>
+    <div id="vmsg" hidden><span id="vmsgt"></span><button id="vrestart" hidden>Restart</button></div>
+    <button id="vprev" class="vnav" title="Previous (←)">‹</button>
+    <button id="vnext" class="vnav" title="Next (→)">›</button>
+    <button id="vclose" title="Close (Backslash)">✕</button>
   </div>
+  <div id="vpv" hidden><div id="vptile"></div><canvas id="vpvc" width="1" height="1" hidden></canvas><span id="vpvt"></span></div>
+  <div id="vtov" hidden></div>
   <div id="cut" hidden>
     <div id="cpop" hidden><div id="ctile"></div><img id="cimg" alt=""><span id="ctime"></span></div>
     <div id="ctrack"><div id="cregs"></div><div id="cmark" hidden></div><div id="ccur"></div></div>
@@ -3396,7 +3727,7 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
     <div id="cinfo"></div>
     <div id="crow">
       <button id="cclr" title="Remove all marks">Reset</button>
-      <button id="conly" title="Keep only the selected piece: everything before and after it is removed (K)">Keep only this (K)</button>
+      <button id="conly" title="Trim now, keeping only the selected piece: everything before and after it is removed (K)">Keep only this… (K)</button>
       <button id="cgo" class="go" title="Remove the red parts from the video file">Trim…</button>
       <button id="cexit" title="Close trimming (Esc)">Close</button>
       <span class="sp"></span>
@@ -3411,21 +3742,29 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
       ←/→ move the cursor by 1 s, with Shift by 10 s, with Ctrl by a minute. Striped parts stay too:
       without re-encoding a kept part has to start at a keyframe.</p>
   </div>
-  <div id="vb">
-    <button id="prev" title="Previous (←)">‹</button>
-    <button id="next" title="Next (→)">›</button>
-    <span id="vname"></span>
-    <span id="vpos" class="dim"></span>
-    <span id="vmeta"></span>
-    <span id="vtrim" hidden><span id="vtrimt"></span><button id="vtstop" title="Stop trimming: the video stays unchanged">Stop</button></span>
-    <button id="pdir" title="Previous folder ([)">Prev. folder</button>
-    <button id="ndir" title="Next folder (])">Next folder</button>
-    <button id="vpk" title="Select for bulk actions (X)">Select (X)</button>
-    <button id="vhere" title="Play the video right here (P)">Play here (P)</button>
-    <button id="vopen" title="Open in the video player (Enter)">Open video</button>
-    <button id="vcut" title="Cut unwanted parts: the start, the end or pieces in the middle (C)">Trim video</button>
-    <button id="vdel" class="del" title="Delete the video with its preview (Del)">Delete video</button>
-    <button id="vclose" title="Close (Esc). The I key hides this bar">Close</button>
+  <div id="vpanelbar">
+    <div id="vtl" hidden title="Timeline: click a frame to jump there"><canvas id="vtlc"></canvas><div id="vtlm"></div><span id="vtlt" hidden></span></div>
+    <div id="vseek" hidden><div id="vtrack"></div><div id="vfill"></div><div id="vknob"></div></div>
+    <div id="vrow">
+      <span id="vname"></span><span id="vpos" class="dim"></span><span id="vmeta"></span>
+      <div id="vpl" hidden>
+        <button id="vplay" title="Play / pause (Space)" aria-label="Play">▶</button>
+        <button id="vrate" title="Playback speed (Shift+, and Shift+.)">1×</button>
+        <span class="sp"></span><span id="vtime">0:00 / 0:00</span>
+        <button id="vmute" tabindex="-1" title="Mute (M)"><svg class="i-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z" fill="currentColor"/><path d="M15.5 9a4 4 0 010 6M18 6.5a8 8 0 010 11"/></svg><svg class="i-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z" fill="currentColor"/><path d="M16 9.5l5 5M21 9.5l-5 5"/></svg></button>
+        <input id="vvol" type="range" min="0" max="1" step="0.01" aria-label="Volume (↑ ↓)">
+        <button id="vtlb" title="Timeline (T)">T</button>
+        <span id="voptions"><button id="vauto" title="Autoplay" aria-label="Autoplay">A▶</button><button id="vnextEnd" title="Next video on end" aria-label="Next video on end">▶|</button><button id="vloop" title="Loop" aria-label="Loop">↻</button></span>
+      </div>
+      <div id="vb">
+        <button id="vpk" title="Select for bulk actions (X)">Select (X)</button>
+        <button id="vhere" title="Play the video here / show the preview sheet (P)">Play (P)</button>
+        <button id="vopen" title="Open in the external video player">Open video</button>
+        <button id="vcut" title="Cut unwanted parts (C)">Trim (C)</button>
+        <button id="vdel" class="del" title="Delete the video with its preview (Del)">Delete video</button>
+      </div>
+      <span id="vtrim" hidden><span id="vtrimt"></span><button id="vtstop" title="Stop trimming: the video stays unchanged">Stop</button></span>
+    </div>
   </div>
 </div>
 <div id="dlg" hidden>
@@ -3457,6 +3796,9 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
   </div>
   <div id="plp" class="sheet" hidden>
     <h2>Video player</h2>
+    <h3>What Enter and Play open</h3>
+    <div id="plmode"></div>
+    <h3>External player</h3>
     <p id="plt" class="dim"></p>
     <div id="pll"></div>
     <div class="acts"><button id="plmpc" hidden>Get MPC-HC</button><button id="plpick">Choose another program…</button><button id="plclose" class="go">Close</button></div>
@@ -3466,37 +3808,49 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
     <div class="keys">
       <h3>Gallery</h3>
       <span><kbd>←</kbd> <kbd>→</kbd> <kbd>↑</kbd> <kbd>↓</kbd> <kbd>Home</kbd> <kbd>End</kbd></span><span>select a preview</span>
-      <span><kbd>Space</kbd></span><span>full screen view</span>
-      <span><kbd>Enter</kbd></span><span>open the video in the player</span>
+      <span><kbd>Enter</kbd> <kbd>Space</kbd></span><span>open the preview sheet full screen (Enter opens the external player if it is chosen in Video player)</span>
       <span><kbd>E</kbd></span><span id="kexp">show the file in Explorer</span>
       <span><kbd>Del</kbd></span><span>delete the video (or all selected)</span>
-      <span><kbd>[</kbd> <kbd>]</kbd> <kbd>PgUp</kbd> <kbd>PgDn</kbd></span><span>previous / next folder</span>
+      <span><kbd>Backspace</kbd> <kbd>Alt+↑</kbd></span><span>parent folder</span>
+      <span><kbd>[</kbd> <kbd>]</kbd></span><span>previous / next folder of the same level</span>
+      <span><kbd>PgUp</kbd> <kbd>PgDn</kbd></span><span>previous / next folder with videos, through the whole tree in its order</span>
       <span><kbd>X</kbd> <kbd>Ctrl+A</kbd></span><span>select / select all</span>
       <span><kbd>Esc</kbd></span><span>clear selection</span>
-      <span><kbd>Ctrl+Z</kbd></span><span>undo the last delete</span>
+      <span><kbd>Ctrl+Z</kbd></span><span>undo the last delete or trim</span>
       <span><kbd>F5</kbd></span><span>refresh the file list</span>
       <span><kbd>Right click</kbd></span><span>menu of a preview, a video or a folder: play, show, copy path or file, delete</span>
-      <h3>Full screen view</h3>
-      <span><kbd>←</kbd> <kbd>→</kbd></span><span>previous / next</span>
+      <h3>Folder tree (after a click on a folder)</h3>
+      <span><kbd>↑</kbd> <kbd>↓</kbd> <kbd>Home</kbd> <kbd>End</kbd></span><span>previous / next folder</span>
+      <span><kbd>←</kbd> <kbd>→</kbd></span><span>collapse / expand (or go to the parent / first subfolder)</span>
+      <span><kbd>Del</kbd></span><span>delete the folder with everything in it</span>
+      <span><kbd>Esc</kbd> <kbd>Enter</kbd> <kbd>Tab</kbd></span><span>back to the gallery</span>
+      <h3>Viewer</h3>
+      <span><kbd>←</kbd> <kbd>→</kbd></span><span>previous / next (past the last one: the next folder); mouse wheel too</span>
+      <span><kbd>Space</kbd> <kbd>Enter</kbd> <kbd>P</kbd></span><span>play the video right here</span>
+      <span><kbd>Del</kbd> <kbd>X</kbd> <kbd>E</kbd> <kbd>C</kbd></span><span>delete, select, show in Explorer, trim</span>
+      <span><kbd>[</kbd> <kbd>]</kbd> <kbd>PgUp</kbd> <kbd>PgDn</kbd></span><span>previous / next folder</span>
       <span><kbd>I</kbd></span><span>hide the bottom bar</span>
-      <span><kbd>C</kbd></span><span>trim the video</span>
-      <span><kbd>P</kbd></span><span>play the video right here / back to the preview</span>
-      <span><kbd>Esc</kbd> <kbd>Space</kbd></span><span>close</span>
-      <h3>Built-in player</h3>
-      <span><kbd>Space</kbd></span><span>play / pause</span>
-      <span><kbd>←</kbd> <kbd>→</kbd></span><span>previous / next video (it starts playing)</span>
+      <span><kbd>Esc</kbd> <kbd>\</kbd></span><span>close (from the video: Esc goes back to the sheet, \ closes)</span>
+      <span>Click, double click</span><span>click on the sheet closes, double click — full screen on / off</span>
+      <h3>Playing a video</h3>
+      <span><kbd>Space</kbd></span><span>play / pause (also a click on the video)</span>
+      <span><kbd>←</kbd> <kbd>→</kbd></span><span>previous / next video (it starts if Autoplay is on)</span>
       <span><kbd>Shift+←</kbd> <kbd>→</kbd></span><span>seek 5 s (Ctrl — 30 s, Ctrl+Shift — 2 min)</span>
       <span><kbd>↑</kbd> <kbd>↓</kbd> <kbd>M</kbd></span><span>volume, mute</span>
+      <span><kbd>T</kbd></span><span>strip of frames from the preview sheet over the bar</span>
       <span><kbd>,</kbd> <kbd>.</kbd></span><span>on pause: frame back / forward</span>
       <span><kbd>Shift+,</kbd> <kbd>Shift+.</kbd></span><span>slower / faster (0.5× to 2×)</span>
       <span><kbd>Backspace</kbd></span><span>back to the start</span>
-      <span><kbd>Esc</kbd> <kbd>P</kbd></span><span>back to the preview sheet</span>
+      <span><kbd>Enter</kbd></span><span>full screen on / off</span>
+      <span><kbd>P</kbd> <kbd>Esc</kbd></span><span>back to the preview sheet</span>
+      <span>Buttons in the bar</span><span>A▶ autoplay, ▶| next video at the end, ↻ loop; playback resumes where you stopped</span>
       <h3>Trimming</h3>
       <span><kbd>←</kbd> <kbd>→</kbd></span><span>cursor by 1 s (Shift — 10 s, Ctrl — 1 min)</span>
       <span><kbd>I</kbd> <kbd>O</kbd></span><span>start / end of a piece to remove (red)</span>
-      <span><kbd>K</kbd></span><span>keep only the selected piece, remove the rest</span>
+      <span><kbd>K</kbd></span><span>trim now, keeping only the selected piece</span>
       <span><kbd>Del</kbd></span><span>unmark the selected piece (it stays)</span>
       <span><kbd>Esc</kbd></span><span>clear the mark / selection, close</span>
+      <span>Several videos</span><span>trims wait in a queue and run one after another in the background</span>
     </div>
     <div class="acts"><button id="keyclose" class="go">Close</button></div>
   </div>
@@ -3541,7 +3895,15 @@ let opts = {cols: 10, rows: 9, width: 2560, header: false, hw: ''};
 let refreshing = false;
 let C = null;                        // открытая обрезка видео (см. «обрезка видео»)
 const purl = it => q('/p/' + it.id + '?v=' + Math.round(it.pm || 0));
-let sort = store.get('srt') || 'name';
+// сортировка галереи: ключ (name/date/size) и направление; прежние значения srt (new/old/big) переводятся
+const SRT_OLD = {new: ['date', true], old: ['date', false], big: ['size', true]};
+let sort = store.get('srt') || 'name', sdesc = store.get('sdesc') === '1';
+if (SRT_OLD[sort]) {  // перевести один раз: иначе прежнее значение каждый раз затирало бы выбранное направление
+  [sort, sdesc] = SRT_OLD[sort];
+  store.set('srt', sort);
+  store.set('sdesc', sdesc ? '1' : '0');
+}
+if (!['name', 'date', 'size'].includes(sort)) sort = 'name';
 let deep = store.get('deep') !== '0';
 let treeOn = store.get('tree') !== '0';
 const knownDirs = new Set(['']);
@@ -3558,12 +3920,14 @@ const segCmp = (a, b) => {
 };
 const byName = (a, b) => segCmp(a.dir, b.dir) ||
   a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: 'base'});
-const SORTS = {
-  name: byName,
-  new: (a, b) => b.mtime - a.mtime || byName(a, b),
-  old: (a, b) => a.mtime - b.mtime || byName(a, b),
-  big: (a, b) => b.size - a.size || byName(a, b),
-};
+// направление по умолчанию при выборе ключа: имя — от А до Я, остальное (дата — сначала новые) — от большего
+const sortDesc = k => k !== 'name';
+function itemCmp() {
+  const sg = sdesc ? -1 : 1;
+  if (sort === 'date') return (a, b) => sg * (a.mtime - b.mtime) || byName(a, b);
+  if (sort === 'size') return (a, b) => sg * (a.size - b.size) || byName(a, b);
+  return sdesc ? (a, b) => byName(b, a) : byName;
+}
 const inView = it => deep
   ? (folder === '' || it.dir === folder || it.dir.startsWith(folder + '/'))
   : it.dir === folder;
@@ -3572,8 +3936,14 @@ const label = it => {
   return rel ? rel + '/' + it.name : it.name;
 };
 
-const fmtSize = n => n >= 2 ** 30 ? (n / 2 ** 30).toFixed(2) + ' GB'
-  : n >= 2 ** 20 ? Math.round(n / 2 ** 20) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+const fmtNum = n => String(Math.round(n || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+function fmtSize(n) {
+  if (n == null) return '';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0, x = n;
+  while (x >= 1024 && i < 4) { x /= 1024; i++; }
+  return (i === 0 ? String(x) : x >= 100 ? x.toFixed(0) : x.toFixed(1)) + ' ' + u[i];
+}
 const fmtDate = t => new Date(t * 1000).toLocaleDateString('en-CA');  // 2026-10-25
 const plural = (n, f) => f[n === 1 ? 0 : 1];
 const fmtEta = s => s < 90 ? Math.max(5, Math.round(s)) + ' s' : s < 5400 ? Math.round(s / 60) + ' min'
@@ -3613,54 +3983,161 @@ async function api(path, post, body) {
 
 /* ───── дерево папок ───── */
 
-function dirList() {
-  const s = new Set(['']);
-  knownDirs.forEach(d => {
-    const p = d.split('/');
-    for (let i = 1; i <= p.length; i++) s.add(p.slice(0, i).join('/'));
-  });
-  return [...s].sort((a, b) => a === '' ? -1 : b === '' ? 1 : segCmp(a, b));
-}
+let tsort = ['name', 'date', 'size', 'count'].includes(store.get('tsort')) ? store.get('tsort') : 'name';
+let tdesc = store.get('tdesc') !== null ? store.get('tdesc') === '1' : sortDesc(tsort);
+const openDirs = new Set(['']);
+try {
+  const saved = JSON.parse(store.get('topen') || '[]');
+  if (Array.isArray(saved)) saved.forEach(d => { if (typeof d === 'string') openDirs.add(d); });
+} catch (_) { /* пусто */ }
+openDirs.add('');
+const saveOpen = () => store.set('topen', JSON.stringify([...openDirs].filter(Boolean)));
+const parentOf = d => d.includes('/') ? d.slice(0, d.lastIndexOf('/')) : '';
+const baseName = d => d ? d.slice(d.lastIndexOf('/') + 1) : ROOT;
+
 const src = () => mode === 'videos' ? videos : all;
+const ZERO_STAT = {n: 0, size: 0, mtime: 0};
+function addStat(map, k, it) {
+  let s = map[k];
+  if (!s) s = map[k] = {n: 0, size: 0, mtime: 0};
+  s.n++;
+  s.size += it.size || 0;
+  if ((it.mtime || 0) > s.mtime) s.mtime = it.mtime || 0;
+}
 function counts() {
   const direct = {}, agg = {};
   for (const it of src()) {
-    direct[it.dir] = (direct[it.dir] || 0) + 1;
-    agg[''] = (agg[''] || 0) + 1;
+    addStat(direct, it.dir, it);
+    addStat(agg, '', it);
     const p = it.dir ? it.dir.split('/') : [];
-    for (let i = 1; i <= p.length; i++) {
-      const k = p.slice(0, i).join('/');
-      agg[k] = (agg[k] || 0) + 1;
-    }
+    for (let i = 1; i <= p.length; i++) addStat(agg, p.slice(0, i).join('/'), it);
   }
   return {direct, agg};
 }
-const countIn = (C, d) => (deep ? C.agg[d] : C.direct[d]) || 0;
+const statIn = (C, d) => (deep ? C.agg[d] : C.direct[d]) || ZERO_STAT;
+const countIn = (C, d) => statIn(C, d).n;
+const nodeCount = st => fmtNum(st.n) + (st.size ? ' · ' + fmtSize(st.size) : '');
+
+function treeKeyVal(st) {
+  switch (tsort) {
+    case 'date': return st.mtime;
+    case 'size': return st.size;
+    case 'count': return st.n;
+  }
+  return 0;
+}
+function buildTree(C = counts()) {
+  const s = new Set(['']);
+  knownDirs.forEach(d => {
+    if (!d) return;
+    const p = d.split('/');
+    for (let i = 1; i <= p.length; i++) s.add(p.slice(0, i).join('/'));
+  });
+  const kids = {};
+  s.forEach(d => { kids[d] = []; });
+  s.forEach(d => { if (d !== '') kids[parentOf(d)].push(d); });
+  const sg = tdesc ? -1 : 1;
+  const cmp = (a, b) => {
+    if (tsort !== 'name') {
+      const diff = treeKeyVal(statIn(C, a)) - treeKeyVal(statIn(C, b));
+      if (diff) return sg * diff;
+    }
+    const c = baseName(a).localeCompare(baseName(b), undefined, {numeric: true, sensitivity: 'base'});
+    return tsort === 'name' ? sg * c : c;
+  };
+  Object.values(kids).forEach(arr => arr.sort(cmp));
+  return kids;
+}
+function treeOrder(C) {
+  const kids = buildTree(C), out = [];
+  const walk = d => { out.push(d); for (const k of kids[d]) walk(k); };
+  walk('');
+  return out;
+}
+const dirList = treeOrder;
+function visDirs(kids) {
+  const out = [];
+  const walk = d => {
+    out.push(d);
+    if (d === '' || openDirs.has(d)) for (const k of kids[d]) walk(k);
+  };
+  walk('');
+  return out;
+}
+
+let revFolder = '';
+function revealTree(rel = folder) {
+  revFolder = rel;
+  if (!rel) return;
+  const p = rel.split('/');
+  let changed = false;
+  for (let i = 1; i < p.length; i++) {
+    const a = p.slice(0, i).join('/');
+    if (!openDirs.has(a)) { openDirs.add(a); changed = true; }
+  }
+  if (changed) saveOpen();
+}
+
+function renderCrumbs() {
+  const l = (typeof OSL !== 'undefined' && (OSL[player.os] || OSL.win)) || ['Open in Explorer', 'Open the selected folder in Explorer'];
+  const segs = folder ? folder.split('/') : [];
+  let h = folder ? '<button class="cr" data-d="">' + esc(ROOT || '—') + '</button>' : '<span class="cur">' + esc(ROOT || '—') + '</span>';
+  for (let i = 0; i < segs.length; i++) {
+    const last = i === segs.length - 1, d = segs.slice(0, i + 1).join('/');
+    h += '<span class="sep">›</span>' + (last
+      ? '<span class="cur">' + esc(segs[i]) + '</span>'
+      : '<button class="cr" data-d="' + esc(d) + '">' + esc(segs[i]) + '</button>');
+  }
+  h += '<button class="xpl" title="' + esc(l[1]) + '">' + esc(l[0]) + '</button>';
+  $('#crumbs').innerHTML = h;
+}
 
 function renderTree() {
-  const list = dirList(), C = counts();
+  if (folder !== revFolder) revealTree(folder);
+  const C = counts(), kids = buildTree(C), list = visDirs(kids);
   folderStat();
+  renderCrumbs();
   document.body.classList.toggle('notree', !treeOn);
   $('#dirs').innerHTML = list.map(d => {
     const depth = d ? d.split('/').length : 0;
-    const n = countIn(C, d);
-    return '<button class="dir' + (d === folder ? ' on' : '') + (n ? '' : ' zero') + '" data-d="' + esc(d) +
-      '" title="' + esc(d || ROOT) + '" style="padding-left:' + (8 + depth * 14) + 'px">' +
-      '<span class="dn">' + esc(d ? d.split('/').pop() : ROOT) + '</span><span class="dc">' + n + '</span></button>';
+    const st = statIn(C, d), hasKids = kids[d].length > 0, open = d === '' || openDirs.has(d);
+    const cls = 'tr' + (open && hasKids ? ' open' : '') + (d === folder ? ' on' + (zone === 'tree' ? ' kf' : '') : '') + (st.n ? '' : ' zero');
+    const title = (d || ROOT) + (st.mtime ? ' · ' + fmtDate(st.mtime) : '');
+    return '<div class="' + cls + '" data-d="' + esc(d) + '" title="' + esc(title) + '" style="padding-left:' + (6 + depth * 14) + 'px">' +
+      '<span class="ta' + (hasKids ? '' : ' no') + '"></span>' +
+      '<span class="tnm">' + esc(baseName(d)) + '</span>' +
+      '<span class="tcn">' + esc(nodeCount(st)) + '</span></div>';
   }).join('');
+  const on = $('#dirs .tr.on');
+  if (on) on.scrollIntoView({block: 'nearest'});
 }
 
-function setFolder(d) {
+let treeDefer = 0;
+function syncFolderView() {
+  clearTimeout(treeDefer);
+  treeDefer = 0;
+  if (mode === 'videos') renderVideos();
+  else { applyView(null); select(0); }
+}
+function setFolder(d, defer) {
+  clearTimeout(treeDefer);
+  treeDefer = 0;
   folder = d;
+  revealTree(d);
+  if (defer) {
+    renderTree();
+    treeDefer = setTimeout(syncFolderView, 150);
+    return;
+  }
   if (mode === 'videos') { renderVideos(); renderTree(); return; }
   applyView(null);
   select(0);
 }
 
-// ближайшая за пределами текущего списка папка, где напрямую лежат превью (undefined — такой нет)
+// ближайшая за пределами текущего списка папка, где напрямую лежат элементы (undefined — такой нет)
 function neighbor(dir) {
-  const list = dirList(), C = counts();
-  const L = list.filter(d => (C.direct[d] || 0) > 0);
+  const C = counts(), list = treeOrder(C);
+  const L = list.filter(d => C.direct[d] && C.direct[d].n > 0);
   const inV = d => deep ? (folder === '' || d === folder || d.startsWith(folder + '/')) : d === folder;
   const idx = [];
   L.forEach((d, i) => { if (inV(d)) idx.push(i); });
@@ -3682,13 +4159,92 @@ function crossFolder(dir, last, quiet) {
     }
     return false;
   }
+  clearTimeout(treeDefer);
+  treeDefer = 0;
   folder = t;
+  revealTree(t);
   applyView(null);
   let k = -1;
   items.forEach((it, i) => { if (it.dir === t && (last || k < 0)) k = i; });
   select(k < 0 ? 0 : k);
   toast('Folder: ' + (t || ROOT));
   return true;
+}
+
+// куда идут клавиши: 'grid' — галерея, 'tree' — дерево папок (после клика по строке дерева)
+let zone = 'grid';
+function syncZone() {
+  $('#dirs').querySelectorAll('.kf').forEach(el => el.classList.remove('kf'));
+  if (zone === 'tree') {
+    const on = $('#dirs .tr.on');
+    if (on) on.classList.add('kf');
+  }
+}
+// клавиши дерева, когда клавиатура у него; true — обработано
+function treeKey(e) {
+  if (e.altKey && e.code === 'ArrowUp') { parentFolder(); return true; }
+  if (e.ctrlKey || e.metaKey || e.altKey) return false;
+  const kids = buildTree(), vis = visDirs(kids);
+  switch (e.code) {
+    case 'ArrowUp': case 'ArrowDown': {
+      const i = vis.indexOf(folder);
+      const t = vis[i < 0 ? 0 : Math.max(0, Math.min(vis.length - 1, i + (e.code === 'ArrowDown' ? 1 : -1)))];
+      if (t !== undefined && t !== folder) setFolder(t, e.repeat);
+      return true;
+    }
+    case 'ArrowLeft':
+      if (folder && kids[folder] && kids[folder].length && openDirs.has(folder)) {
+        openDirs.delete(folder);
+        saveOpen();
+        renderTree();
+      } else if (folder) {
+        setFolder(parentOf(folder), e.repeat);
+      }
+      return true;
+    case 'ArrowRight':
+      if (kids[folder] && kids[folder].length) {
+        if (folder && !openDirs.has(folder)) {
+          openDirs.add(folder);
+          saveOpen();
+          renderTree();
+        } else {
+          setFolder(kids[folder][0], e.repeat);
+        }
+      }
+      return true;
+    case 'Home': case 'End': {
+      const t = vis[e.code === 'Home' ? 0 : vis.length - 1];
+      if (t !== undefined && t !== folder) setFolder(t, e.repeat);
+      return true;
+    }
+    case 'Delete':
+      if (!e.repeat) {
+        if (!folder) toast('The root folder cannot be deleted');
+        else folderDelete(folder);
+      }
+      return true;
+    case 'Backspace':
+      if (!e.repeat) parentFolder();
+      return true;
+    case 'Enter': case 'NumpadEnter': case 'Escape': case 'Tab':
+      zone = 'grid';
+      syncZone();
+      return true;
+  }
+  return false;
+}
+// на уровень вверх: родительская папка выбранной
+function parentFolder() {
+  if (!folder) return;
+  setFolder(parentOf(folder));
+}
+// соседняя папка того же уровня (порядок дерева)
+function siblingFolder(dir) {
+  if (!folder) { toast('No more folders on this level'); return; }
+  const kids = buildTree()[parentOf(folder)] || [];
+  const i = kids.indexOf(folder), t = i >= 0 ? kids[i + dir] : undefined;
+  if (t === undefined) toast('No more folders on this level');
+  else setFolder(t);
 }
 
 /* ───── сетка ───── */
@@ -3700,13 +4256,22 @@ function tile(it) {
   if (picked.has(it.id)) f.classList.add('pick');
   f.innerHTML =
     '<div class="im"><span class="pk" title="Select: click here, X or Ctrl+click the preview; Shift+click selects a range"></span><img loading="lazy" alt="" src="' + purl(it) + '">' +
-    (it.nv ? '' : '<b class="nov">no video</b>') + '</div>' +
+    (it.nv ? '' : '<b class="nov">no video</b>') + wbHtml(it) + '</div>' +
     '<figcaption>' + (it.err ? '<div class="err">' + esc(it.err) + '</div>' : '') +
     '<div class="nm" title="' + esc(full(it)) + '">' + esc(label(it)) + '</div>' +
     '<div class="row">' + spans(it) +
-    '<span class="bt"><button data-a="open"' + (it.nv ? '' : ' disabled') + '>Open video</button>' +
+    '<span class="bt"><button data-a="open"' + (it.nv ? '' : ' disabled') + ' title="' + (player.external ? 'Open in ' + esc(player.name) : 'Play the video right here') + '">Play</button>' +
     '<button data-a="del" class="del" title="' + (it.nv ? 'Delete the video with its preview' : 'Delete the preview') + ' (Del)">Delete</button></span></div></figcaption>';
   return f;
+}
+
+// полоска «досмотрено» внизу картинки плитки: позиция из /api/list (pos, dur) или после просмотра здесь
+const wbHtml = it => it.pos > 0 && it.dur > 0 ? '<i class="wb" style="width:' + Math.min(100, 100 * it.pos / it.dur).toFixed(1) + '%"></i>' : '';
+// кнопка Play на плитке и «Play here» в меню: встроенный плеер (с опцией external — внешний)
+function playItem(i, here) {
+  if (!items[i] || !items[i].nv) return;
+  select(i, false);
+  if (player.external && !here) openCur(); else openViewer(true);
 }
 
 function stat() {
@@ -3738,7 +4303,7 @@ function render() {
 // focusId: undefined — остаться на текущем превью, null — начать сначала, число — встать на это превью
 function applyView(focusId) {
   if (focusId === undefined && items[cur]) focusId = items[cur].id;
-  items = all.filter(inView).sort(SORTS[sort]);
+  items = all.filter(inView).sort(itemCmp());
   const vis = new Set(items.map(i => i.id));
   picked.forEach(id => { if (!vis.has(id)) picked.delete(id); });   // выделенным остаётся только то, что сейчас в списке
   cur = focusId == null ? 0 : Math.max(0, items.findIndex(x => x.id === focusId));
@@ -3753,7 +4318,7 @@ function select(i, scroll = true) {
   const f = grid.children[cur];
   f.classList.add('sel');
   if (scroll) f.scrollIntoView({block: 'nearest'});
-  if (viewer) showViewer();
+  if (viewer) { showViewer(); renderCutBar(); }
 }
 
 function go(n) {
@@ -3767,283 +4332,592 @@ function go(n) {
 
 /* ───── крупный просмотр (на весь экран) ───── */
 
-function showViewer() {
-  if (C && (!viewer || !items[cur] || items[cur].id !== C.id)) closeCut(true);
-  $('#v').hidden = !viewer;
-  document.body.classList.toggle('viewing', viewer);
-  if (!viewer) { if (P.on || P.id !== null) playerOff(); return; }
-  const it = items[cur];
-  $('#vi').src = purl(it);
-  $('#vname').textContent = full(it);
-  $('#vname').title = full(it);
-  $('#vpk').textContent = picked.has(it.id) ? '✓ Selected' : 'Select (X)';
-  $('#vpos').textContent = (cur + 1) + ' of ' + items.length;
-  $('#vmeta').innerHTML = spans(it);
-  $('#vopen').disabled = !it.nv;
-  $('#vcut').disabled = it.nv !== 1;
-  $('#verr').hidden = !it.err;
-  $('#verr').textContent = it.err ? 'Not deleted: ' + it.err : '';
-  $('#vdel').textContent = it.nv ? 'Delete video' : 'Delete preview';
-  $('#vhere').disabled = !it.nv && !P.on;
-  if (P.on) pShow(it);
-  for (const d of [1, 2, -1]) if (items[cur + d]) new Image().src = purl(items[cur + d]);
-}
-
+let fsOn = false;
 const winApi = () => (window.pywebview && window.pywebview.api && window.pywebview.api.set_fullscreen) ? window.pywebview.api : null;
 function enterFs() {
-  if (winApi()) { winApi().set_fullscreen(true); return; }
-  const el = document.documentElement;
-  if (!document.fullscreenElement && el.requestFullscreen) {
-    const p = el.requestFullscreen();
+  if (winApi()) {
+    fsOn = true;
+    try { Promise.resolve(winApi().set_fullscreen(true)).catch(() => {}); } catch (_) { /* окно не ответило */ }
+    fsChanged();
+    return;
+  }
+  if (!document.fullscreenElement && document.documentElement.requestFullscreen) {
+    const p = document.documentElement.requestFullscreen();
     if (p && p.catch) p.catch(() => {});
   }
 }
 function leaveFs() {
-  if (winApi()) { winApi().set_fullscreen(false); return; }
+  if (winApi()) {
+    fsOn = false;
+    try { Promise.resolve(winApi().set_fullscreen(false)).catch(() => {}); } catch (_) { /* окно не ответило */ }
+    fsChanged();
+    return;
+  }
   if (document.fullscreenElement && document.exitFullscreen) {
     const p = document.exitFullscreen();
     if (p && p.catch) p.catch(() => {});
   }
 }
-function openViewer() {
+const toggleFs = () => { if (fsOn) leaveFs(); else enterFs(); };
+function fsChanged() { if (viewer) barShow(); }
+document.addEventListener('fullscreenchange', () => { fsOn = !!document.fullscreenElement; fsChanged(); });
+
+function hud(text, sticky = false) {
+  clearTimeout(P.hudT);
+  $('#vrestart').hidden = true;
+  $('#vmsgt').textContent = text;
+  $('#vmsg').className = sticky ? 'err' : '';
+  $('#vmsg').style.bottom = '';
+  $('#vmsg').hidden = false;
+  if (!sticky) P.hudT = setTimeout(() => { $('#vmsg').hidden = true; }, 1200);
+}
+function barShow() {
+  if (!viewer) return;
+  $('#v').classList.remove('idle');
+  clearTimeout(P.idleT);
+  if (!fsOn || !$('#v').classList.contains('playing') || C) return;
+  const arm = () => {
+    P.idleT = setTimeout(() => {
+      if (!viewer || !fsOn || !$('#v').classList.contains('playing') || C) return;
+      if ($('#vpanelbar').matches(':hover')) arm(); else { $('#v').classList.add('idle'); pvHide(); }
+    }, 2000);
+  };
+  arm();
+}
+function showViewer() {
+  if (C && (!viewer || !items[cur] || items[cur].id !== C.id)) closeCut(true);
+  $('#v').hidden = !viewer;
+  document.body.classList.toggle('viewing', viewer);
+  if (!viewer) { playerOff(); return; }
+  const it = items[cur];
+  if (!it) { closeViewer(); return; }
+  if (P.shown !== it.id || P.shownVer !== it.mtime) {
+    clearTimeout(P.clickT);
+    clearTimeout(P.hudT);
+    $('#vmsg').hidden = true;
+    P.shown = it.id;
+    P.shownVer = it.mtime;
+  }
+  if ($('#vi').getAttribute('src') !== purl(it)) $('#vi').src = purl(it);
+  $('#vname').textContent = $('#vname').title = full(it);
+  $('#vpk').textContent = picked.has(it.id) ? '✓ Selected' : 'Select (X)';
+  $('#vpos').textContent = (cur + 1) + ' / ' + items.length;
+  $('#vmeta').innerHTML = spans(it);
+  $('#vopen').textContent = 'Open in ' + player.name;
+  $('#vopen').disabled = !it.nv;
+  $('#vcut').disabled = it.nv !== 1 || trimBusy(it.id);
+  $('#verr').hidden = !it.err;
+  $('#verr').textContent = it.err ? 'Not deleted: ' + it.err : '';
+  $('#vdel').textContent = it.nv ? 'Delete video' : 'Delete preview';
+  $('#vhere').disabled = !it.nv && !P.on;
+  if (P.on) pShow(it); else pView(false);
+  for (const d of [1, 2, -1]) if (items[cur + d]) new Image().src = purl(items[cur + d]);
+  barShow();
+}
+function openViewer(play = false) {
   if (!items.length) return;
+  pRelease();
+  P.on = !!play;
+  P.start = !!play;
+  P.shown = null;
+  P.tlWarn = null;
+  P.prefetched.clear();
+  P.infos.clear();
   viewer = true;
   showViewer();
   enterFs();
 }
 function closeViewer(exitFs = true) {
+  clearTimeout(P.clickT);
+  clearTimeout(P.idleT);
+  clearTimeout(P.hudT);
+  clearTimeout(P.tovT);
+  $('#vtov').hidden = $('#vmsg').hidden = true;
   viewer = false;
   showViewer();
   if (exitFs) leaveFs();
 }
-// Esc в полноэкранном режиме обрабатывает сам браузер — просмотр закрываем по выходу из полного экрана
-document.addEventListener('fullscreenchange', () => { if (!document.fullscreenElement && viewer) closeViewer(false); });
+// Сообщения дерева остаются снаружи просмотра; здесь используем HUD.
+function vCross(dir, last = false) {
+  const ok = crossFolder(dir, last, true);
+  $('#toast').className = '';
+  hud(ok ? 'Folder: ' + (folder || ROOT) : dir > 0 ? 'Last folder' : 'First folder');
+  return ok;
+}
+function vGo(n) {
+  if (C) return;
+  if (n < 0 || n >= items.length) { vCross(n < 0 ? -1 : 1, n < 0); return; }
+  go(n);
+}
 
 /* ───── встроенный плеер (как в VO Media): видео прямо в просмотре вместо листа ───── */
 
-// P — состояние плеера: on — режим включён (листание открывает видео следующих превью), id — чьё видео загружено,
-// bad — не играет здесь, seekT — отложенная цель перемотки, info/L — сетка листа для кадра над шкалой
 const vv = $('#vv'), RATES = [0.5, 0.75, 1, 1.25, 1.5, 2];
-const P = {on: false, id: null, ver: null, bad: false, seekT: null, loadT: 0, raf: 0, drag: false, info: null, infoFor: null, L: null};
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const P = {on: false, id: null, ver: null, file: null, bad: false, seekT: null, loadT: 0, raf: 0, drag: false,
+  info: null, L: null, infos: new Map(), prefetched: new Set(), start: false, shown: null, shownVer: null,
+  idleT: 0, hudT: 0, clickT: 0, tovT: 0, wheelAt: 0, watchT: 0, watched: 0, watchAt: 0, saveAt: 0,
+  playing: false, resumed: false, trimFor: null, tlWarn: null};
 let pVol = clamp(parseFloat(store.get('vol') ?? '1') || 0, 0, 1), pMuted = store.get('mute') === '1';
 let pRate = RATES.includes(+store.get('rate')) ? +store.get('rate') : 1;
+let pAuto = store.get('auto') !== '0', pNext = store.get('next') === '1', pLoop = store.get('loop') === '1', pTl = store.get('tl') === '1';
+const pDur = () => (Number.isFinite(vv.duration) && vv.duration > 0 ? vv.duration : 0);
+const pUrl = it => q('/v/' + it.id + '?m=' + it.mtime);
 
+function pControls() {
+  for (const [id, on, label] of [['vauto', pAuto, 'Autoplay'], ['vnextEnd', pNext, 'Next video on end'], ['vloop', pLoop, 'Loop']]) {
+    const b = $('#' + id);
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', String(on));
+    b.title = label + ': ' + (on ? 'on' : 'off');
+  }
+  $('#vtlb').classList.toggle('on', pTl);
+  $('#vtlb').setAttribute('aria-pressed', String(pTl));
+  $('#vrate').textContent = pRate + '×';
+  vv.loop = pLoop;
+}
+function pView(video) {
+  $('#v').classList.toggle('playing', video);
+  $('#vi').hidden = video;
+  vv.hidden = !video;
+  $('#vpl').hidden = $('#vseek').hidden = !video;
+  if (!video) { $('#vtl').hidden = true; $('#v').classList.remove('idle'); }
+  $('#vhere').textContent = P.on ? 'Sheet (P)' : 'Play (P)';
+  pControls();
+}
 function playerOn() {
   const it = items[cur];
   if (!viewer || !it) return;
-  if (!it.nv) { toast('This preview has no video', true); return; }
+  if (!it.nv) { hud('This preview has no video'); return; }
   if (C) closeCut(true);
   P.on = true;
+  P.start = true;
   pShow(it);
+  barShow();
 }
-// назад к листу превью; файл видео отпускается (иначе в Windows его нельзя удалить или обрезать)
 function playerOff() {
-  P.on = false;
   pRelease();
-  $('#vi').hidden = false;
-  $('#vpl').hidden = $('#vfail').hidden = true;
-  $('#vhere').textContent = 'Play here (P)';
+  P.on = false;
+  P.start = false;
+  $('#vfail').hidden = true;
+  pView(false);
+  barShow();
 }
+function pWatch() {
+  const now = performance.now();
+  if (P.watchAt && P.playing && !vv.paused && !vv.seeking && vv.readyState >= 3) {
+    P.watched += Math.max(0, Math.min(1, (now - P.watchAt) / 1000));
+  }
+  P.watchAt = now;
+}
+function pProgress(leaving) {
+  const it = P.file, dur = pDur(), pos = vv.currentTime, now = performance.now();
+  if (!it || it.nv !== 1 || P.bad || P.watched <= 10 || !dur || !Number.isFinite(pos)) return;
+  if (!leaving && now - P.saveAt < 10000) return;
+  P.saveAt = now;
+  for (const f of new Set([it, ...all.filter(f => f.id === it.id), ...items.filter(f => f.id === it.id)])) {
+    if (pos < 10 && pos < dur - 5) { delete f.pos; delete f.dur; }
+    else { f.pos = pos >= dur - 5 ? dur : pos; f.dur = dur; }
+  }
+  const im = grid.querySelector('figure[data-id="' + it.id + '"] .im');
+  if (im) { const b = im.querySelector('.wb'); if (b) b.remove(); im.insertAdjacentHTML('beforeend', wbHtml(it)); }
+  fetch(q('/api/progress'), {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id: it.id, pos, dur}), keepalive: !!leaving}).catch(() => {});
+}
+// Отпустить оба видео до удаления, обрезки, листания и закрытия.
 function pRelease() {
+  clearTimeout(P.clickT);
+  pWatch();
+  pProgress(true);
+  P.playing = false;
   clearTimeout(P.loadT);
+  clearInterval(P.watchT);
   cancelAnimationFrame(P.raf);
   P.drag = false;
   P.seekT = null;
-  $('#vpop').hidden = true;
-  if (P.id !== null) {
+  pvStop();
+  $('#vtl').hidden = true;
+  const loaded = P.id !== null;
+  P.id = null;
+  P.file = null;
+  P.info = P.L = null;
+  if (loaded) {
     vv.pause();
     vv.removeAttribute('src');
-    vv.load();  // освободить соединение и файл
-    P.id = null;
+    vv.load();
   }
   vv.hidden = true;
 }
-// показать текущее превью в режиме плеера: у видео — загрузить и запустить, у превью без видео — лист
+function pPrefetch() {
+  const it = items.slice(cur + 1).find(it => it.nv && !trimBusy(it.id));
+  if (!it || P.prefetched.has(it.id)) return;
+  P.prefetched.add(it.id);
+  api('/api/prefetch', true, {id: it.id}).catch(() => {});
+}
 function pShow(it) {
-  $('#vhere').textContent = 'Show preview (P)';
-  if (!it.nv) {
+  const play = P.start || pAuto;
+  P.start = false;
+  pPrefetch();
+  if (!it.nv || trimBusy(it.id)) {
     pRelease();
-    $('#vi').hidden = false;
-    $('#vpl').hidden = $('#vfail').hidden = true;
+    $('#vfail').hidden = true;
+    pView(false);
+    if (trimBusy(it.id) && P.trimFor !== it.id) { P.trimFor = it.id; hud('This video is being trimmed'); }
     return;
   }
-  // уже загружено (или уже известно, что здесь не играет); версия — по mtime: после Ctrl+Z обрезки на месте другой файл
-  if (P.id === it.id && P.ver === it.mtime) return;
+  P.trimFor = null;
+  if (P.id === it.id && P.ver === it.mtime) {
+    if (!P.bad && P.file !== it) { P.file = it; pNeedInfo(); }
+    return;
+  }
   pRelease();
   P.id = it.id;
   P.ver = it.mtime;
-  P.bad = false;
+  P.file = it;
+  P.bad = P.resumed = false;
+  P.watched = P.watchAt = 0;
+  P.saveAt = performance.now();
   $('#vfail').hidden = true;
-  $('#vi').hidden = true;
-  vv.hidden = false;
-  $('#vpl').hidden = false;
+  pView(true);
   vv.preload = 'auto';
-  vv.src = q('/v/' + it.id + '?m=' + Math.round(it.mtime || 0));
+  vv.src = pUrl(it);
   pApplyVol();
-  vv.playbackRate = pRate;
-  $('#vrate').textContent = pRate + '×';
-  const p = vv.play();
-  if (p && p.catch) p.catch(() => {});
+  vv.defaultPlaybackRate = vv.playbackRate = pRate;  // load() возвращает playbackRate к defaultPlaybackRate
+  if (play) pPlay(); else vv.load();
   P.loadT = setTimeout(() => { if (P.id === it.id && vv.readyState < 2) pFail(); }, 10000);
+  P.watchT = setInterval(() => { pWatch(); pProgress(false); }, 1000);
+  pNeedInfo();
   pUi();
 }
 function pFail() {
   if (P.id === null || P.bad) return;
-  P.bad = true;
-  const id = P.id;
+  const it = P.file;
   pRelease();
-  P.id = id;  // запомнить, чтобы не пытаться снова при каждом показе
-  $('#vi').hidden = false;
-  $('#vpl').hidden = true;
+  P.id = it.id;
+  P.file = it;
+  P.bad = true;
+  pView(false);
   $('#vfail').hidden = false;
   $('#vfext').textContent = 'Open in ' + player.name;
 }
-const pDur = () => (isFinite(vv.duration) && vv.duration > 0 ? vv.duration : 0);
+function pMetadata() {
+  if (P.id === null || P.bad) return;
+  const it = P.file, dur = pDur();
+  if (!P.resumed) {
+    P.resumed = true;
+    if (it && typeof it.pos === 'number' && it.pos > 10 && it.pos < dur - 10) {
+      pSeekTo(it.pos);
+      hud('Resumed at ' + fmtT(it.pos));
+      $('#vmsg').classList.add('low');
+      $('#vmsg').style.bottom = (document.body.classList.contains('nobar') ? 16 : $('#vpanelbar').offsetHeight + 6) + 'px';
+      $('#vrestart').hidden = false;
+      clearTimeout(P.hudT);
+      P.hudT = setTimeout(() => { $('#vmsg').hidden = $('#vrestart').hidden = true; }, 2000);
+    }
+  }
+  pUi();
+}
 function pUi() {
   const d = pDur(), t = P.seekT ?? vv.currentTime ?? 0, pc = d ? clamp(t / d, 0, 1) * 100 : 0;
   $('#vfill').style.width = pc + '%';
-  $('#vknob').style.left = pc + '%';
+  $('#vknob').style.left = $('#vtlm').style.left = pc + '%';
   $('#vtime').textContent = fmtT(t) + ' / ' + fmtT(d);
   $('#vplay').textContent = vv.paused ? '▶' : '❚❚';
+  $('#vplay').setAttribute('aria-label', vv.paused ? 'Play' : 'Pause');
+  if (!$('#vtov').hidden) $('#vtov').textContent = $('#vtime').textContent;
 }
 function pTick() {
+  if (!viewer || P.id === null || P.bad) return;
+  pWatch();
   pUi();
   if (!vv.paused && !vv.ended) P.raf = requestAnimationFrame(pTick);
 }
-function pToggle() {
-  if (P.id === null || P.bad) return;
-  if (vv.paused) { const p = vv.play(); if (p && p.catch) p.catch(() => {}); } else vv.pause();
-}
-// зажатая клавиша шлёт ~30 перемоток в секунду: каждая новая обрывала бы прошлую до показа кадра (по SMB видео стоит).
-// Пока идёт перемотка, копим цель; последнюю отправит 'seeked'
+function pPlay() { const p = vv.play(); if (p && p.catch) p.catch(() => {}); }
+function pToggle() { if (P.id !== null && !P.bad) { if (vv.paused) pPlay(); else vv.pause(); } }
+// Цели зажатой клавиши копятся, последнюю отправляет seeked.
 function pSeekTo(t) {
   if (P.id === null || P.bad) return;
   t = clamp(t, 0, pDur() || t);
   if (vv.seeking) P.seekT = t;
-  else {
-    P.seekT = null;
-    try { vv.currentTime = t; } catch (_) { /* метаданные ещё не пришли */ }
-  }
+  else { P.seekT = null; try { vv.currentTime = t; } catch (_) { /* метаданные ещё не готовы */ } }
   pUi();
 }
-const pSeekBy = dt => pSeekTo((P.seekT ?? vv.currentTime ?? 0) + dt);
+function vTimeFlash() {
+  if (!$('#v').classList.contains('idle') && !document.body.classList.contains('nobar')) return;
+  const r = $('#vtime').getBoundingClientRect(), ok = r.width && r.top >= 0 && r.bottom <= innerHeight;
+  $('#vtov').style.left = (ok ? r.left + r.width / 2 : innerWidth / 2) + 'px';
+  $('#vtov').style.top = (ok ? r.top + r.height / 2 : innerHeight - 36) + 'px';
+  $('#vtov').textContent = $('#vtime').textContent;
+  $('#vtov').hidden = false;
+  clearTimeout(P.tovT);
+  P.tovT = setTimeout(() => { $('#vtov').hidden = true; }, 1200);
+}
+const pSeekBy = dt => { pSeekTo((P.seekT ?? vv.currentTime ?? 0) + dt); if (P.id !== null && !P.bad) vTimeFlash(); };
 function pApplyVol() {
   vv.volume = pVol;
   vv.muted = pMuted;
   $('#vvol').value = pMuted ? 0 : pVol;
-  $('#vmute').textContent = pMuted || !pVol ? 'Sound off' : 'Sound on';
+  $('#vmute').classList.toggle('off', pMuted || !pVol);
+  $('#vmute').setAttribute('aria-label', pMuted || !pVol ? 'Unmute' : 'Mute');
 }
 function pVolBy(d) {
   pVol = clamp(Math.round((pVol + d) * 100) / 100, 0, 1);
   if (d > 0) pMuted = false;
-  store.set('vol', pVol);
+  store.set('vol', String(pVol));
   store.set('mute', pMuted ? '1' : '0');
   pApplyVol();
-  toast('Volume ' + Math.round(pVol * 100) + '%');
+  hud('Volume ' + Math.round(pVol * 100) + '%');
 }
 function pMute() {
   pMuted = !pMuted;
   store.set('mute', pMuted ? '1' : '0');
   pApplyVol();
-  toast(pMuted ? 'Muted' : 'Volume ' + Math.round(pVol * 100) + '%');
+  hud(pMuted ? 'Muted' : 'Volume ' + Math.round(pVol * 100) + '%');
 }
-function pRateBy(dir) {
-  pRate = RATES[clamp(RATES.indexOf(pRate) + dir, 0, RATES.length - 1)];
-  store.set('rate', pRate);
-  vv.playbackRate = pRate;
-  $('#vrate').textContent = pRate + '×';
-  toast('Speed ' + pRate + '×');
+function pRateBy(dir, cycle = false) {
+  pRate = RATES[cycle ? (RATES.indexOf(pRate) + 1) % RATES.length : clamp(RATES.indexOf(pRate) + dir, 0, RATES.length - 1)];
+  store.set('rate', String(pRate));
+  vv.defaultPlaybackRate = vv.playbackRate = pRate;
+  pControls();
+  hud('Speed ' + pRate + '×');
+}
+function pEnded() {
+  if (!viewer || !P.on || P.bad) return;
+  pWatch();
+  pProgress(true);
+  pUi();
+  if (!pNext || pLoop) return;
+  const it = P.file;
+  for (let i = cur + 1; i < items.length; i++) {
+    if (it && items[i].dir === it.dir && items[i].nv) { P.start = true; go(i); return; }
+  }
 }
 
-// клавиши в режиме плеера; true — клавиша обработана. ←/→ без модификаторов, Del, [ ] и прочее — как в обычном просмотре
-function pKey(e) {
-  if (e.code === 'KeyP' && !e.ctrlKey) { playerOff(); return true; }
-  if (e.code === 'Escape') { playerOff(); return true; }
-  // в режиме плеера Backspace — к началу и никогда не удаление (даже если видео тут не играет); удаление — Del
-  if (e.code === 'Backspace') { if (P.id !== null && !P.bad) pSeekTo(0); return true; }
-  if (P.id === null || P.bad) return false;
-  const k = e.code;
-  if ((k === 'Comma' || k === 'Period') && !e.ctrlKey) {
-    const dir = k === 'Comma' ? -1 : 1;
-    if (e.shiftKey) pRateBy(dir);
-    else if (vv.paused) pSeekBy(dir / 30);  // кадр назад/вперёд (около 1/30 с)
-    return true;
+// Сетка листа запрашивается один раз на версию видео за сеанс просмотра.
+function pNeedInfo() {
+  const it = P.file;
+  if (!it || P.bad) return;
+  if (it.nv !== 1 || !ff.ok) {
+    if (pTl && P.tlWarn !== it.id) { P.tlWarn = it.id; hud('Timeline needs a preview made by this program'); }
+    return;
   }
-  switch (k) {
-    case 'Space': pToggle(); return true;
-    case 'ArrowUp': pVolBy(0.05); return true;
-    case 'ArrowDown': pVolBy(-0.05); return true;
-    case 'KeyM': if (e.ctrlKey) return false; pMute(); return true;
-    case 'ArrowLeft': case 'ArrowRight':
-      if (!e.ctrlKey && !e.shiftKey) return false;
-      pSeekBy((k === 'ArrowLeft' ? -1 : 1) * (e.ctrlKey ? (e.shiftKey ? 120 : 30) : 5));
-      return true;
+  const key = it.id + ':' + it.mtime + ':' + it.pm;
+  if (!P.infos.has(key)) P.infos.set(key, api('/api/cut/info', true, {id: it.id}).catch(() => null));
+  P.infos.get(key).then(info => {
+    if (!viewer || P.file !== it || P.bad) return;
+    P.info = info;
+    pLayout();
+    if (!info && pTl && P.tlWarn !== it.id) { P.tlWarn = it.id; hud('Timeline needs a preview made by this program'); }
+  });
+}
+function pLayout() {
+  const im = $('#vi');
+  P.L = P.info && P.file && im.complete && im.getAttribute('src') === purl(P.file) ? sheetLayout(P.info) : null;
+  tlApply();
+  if (pTl && P.info && im.complete && !P.L && P.tlWarn !== P.id) {
+    P.tlWarn = P.id;
+    hud('Timeline needs a preview made by this program');
   }
-  return false;
+  if (H.on) pvFrame();
 }
 
-vv.addEventListener('play', () => { cancelAnimationFrame(P.raf); P.raf = requestAnimationFrame(pTick); });
-vv.addEventListener('pause', pUi);
+const TL = {m: 0, idx: [], cw: 0, gap: 2, dpr: 1};
+const TLH = {on: false, x: 0};
+function tlApply() {
+  $('#vtl').hidden = !(viewer && P.id !== null && !P.bad && pTl && P.L);
+  $('#vtlt').hidden = true;
+  pControls();
+  if (!$('#vtl').hidden) { tlDraw(); pUi(); }
+}
+function tlToggle() {
+  pTl = !pTl;
+  store.set('tl', pTl ? '1' : '0');
+  tlApply();
+  if (P.id === null) hud('Timeline ' + (pTl ? 'on' : 'off'));  // на листе: просто состояние, полоса появится в режиме видео
+  else if (pTl && !P.L && (P.info || !ff.ok || (P.file && P.file.nv !== 1))) hud('Timeline needs a preview made by this program');
+}
+function tlLayout() {
+  const c = $('#vtlc'), r = $('#vtl').getBoundingClientRect();
+  TL.dpr = Math.min(2, window.devicePixelRatio || 1);
+  c.width = Math.max(1, Math.round(r.width * TL.dpr));
+  c.height = Math.max(1, Math.round(r.height * TL.dpr));
+  if (!P.L) { TL.m = 0; return; }
+  TL.gap = Math.round(2 * TL.dpr);
+  TL.m = clamp(Math.floor((c.width + TL.gap) / (c.height * P.L.tw / P.L.th + TL.gap)), 1, P.L.n);
+  TL.cw = (c.width - TL.gap * (TL.m - 1)) / TL.m;
+  TL.idx = Array.from({length: TL.m}, (_, k) => clamp(Math.round((k + 0.5) * P.L.n / TL.m - 0.5), 0, P.L.n - 1));
+}
+function tlDraw() {
+  if ($('#vtl').hidden || !P.L || !P.info) return;
+  tlLayout();
+  const c = $('#vtlc'), cx = c.getContext('2d'), L = P.L, info = P.info;
+  cx.clearRect(0, 0, c.width, c.height);
+  TL.idx.forEach((i, k) => {
+    cx.drawImage($('#vi'), (i % info.cols) * (L.tw + 1), info.hh + Math.floor(i / info.cols) * (L.th + 1),
+      L.tw, L.th, Math.round(k * (TL.cw + TL.gap)), 0, Math.round(TL.cw), c.height);
+  });
+}
+function tlTime(x, d) {
+  const r = $('#vtl').getBoundingClientRect();
+  const k = clamp(Math.floor((x - r.left) * TL.dpr / (TL.cw + TL.gap)), 0, TL.m - 1);
+  return P.L && TL.m ? d * TL.idx[k] / P.L.n : 0;
+}
+function tlHover() {
+  if (!TLH.on || $('#vtl').hidden || !pDur()) return;
+  const r = $('#vtl').getBoundingClientRect();
+  $('#vtlt').textContent = fmtT(tlTime(TLH.x, pDur()));
+  $('#vtlt').style.left = clamp(TLH.x - r.left, 28, Math.max(28, r.width - 28)) + 'px';
+  $('#vtlt').hidden = false;
+}
+
+const H = {on: false, x: 0, t: 0, tm: 0};
+let PV = null;
+function pvSize() {
+  const ar = clamp(P.L ? P.L.tw / P.L.th : vv.videoWidth / vv.videoHeight || 16 / 9, 0.3, 4);
+  const w = Math.round(ar >= 240 / 170 ? 240 : 170 * ar), h = Math.max(1, Math.round(w / ar));
+  const c = $('#vpvc'), dpr = Math.min(2, window.devicePixelRatio || 1);
+  if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
+    c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+  }
+  c.style.width = $('#vptile').style.width = w + 'px';
+  c.style.height = $('#vptile').style.height = h + 'px';
+  return {w, h};
+}
+function pvFrame() {
+  if (!H.on || !viewer || P.id === null || P.bad || !pDur()) return;
+  const r = seek.getBoundingClientRect();
+  H.t = clamp((H.x - r.left) / Math.max(1, r.width), 0, 1) * pDur();
+  const {w, h} = pvSize();
+  $('#vpvc').hidden = true;
+  if (P.L) paintTile($('#vptile'), P.L, P.info, H.t, pDur(), w);
+  else $('#vptile').style.backgroundImage = 'none';
+  $('#vpvt').textContent = fmtT(H.t, true);
+  $('#vpv').style.transform = 'translate(' + Math.round(clamp(H.x - w / 2, 8, Math.max(8, innerWidth - w - 18))) + 'px,' + Math.max(0, Math.round(r.top - h - 32)) + 'px)';
+  $('#vpv').hidden = false;
+  clearTimeout(H.tm);
+  H.tm = setTimeout(() => {
+    if (!H.on || P.id === null || P.bad) return;
+    if (!PV) pvCreate(P.file);
+    if (!PV.dead) { PV.want = H.t; pvRun(); }
+  }, 150);
+}
+function pvCreate(it) {
+  const v = document.createElement('video');
+  v.muted = true;
+  v.preload = 'metadata';
+  v.playsInline = true;
+  const p = PV = {v, ready: false, busy: false, want: null, t: 0, tm: 0, dead: false};
+  p.tm = setTimeout(() => pvFail(p), 10000);
+  v.addEventListener('loadedmetadata', () => { if (!p.dead) { clearTimeout(p.tm); p.ready = true; pvRun(); } });
+  const draw = () => {
+    if (p.dead || !p.busy || v.readyState < 2 || v.seeking) return;
+    p.busy = false;
+    clearTimeout(p.tm);
+    if (H.on && p.want === null && Math.abs(p.t - H.t) < 0.05) {
+      pvSize();
+      try { $('#vpvc').getContext('2d').drawImage(v, 0, 0, $('#vpvc').width, $('#vpvc').height); $('#vpvc').hidden = false; } catch (_) { /* кадр ещё не готов */ }
+    }
+    pvRun();
+  };
+  v.addEventListener('seeked', draw);
+  v.addEventListener('loadeddata', draw);
+  v.addEventListener('error', () => pvFail(p));
+  v.src = pUrl(it);
+}
+function pvRun() {
+  const p = PV;
+  if (!p || p.dead || !p.ready || p.busy || p.want === null) return;
+  p.t = p.want;
+  p.want = null;
+  p.busy = true;
+  clearTimeout(p.tm);
+  p.tm = setTimeout(() => pvFail(p), 10000);
+  try { p.v.currentTime = Math.min(p.t, Math.max(0, p.v.duration - 0.01)); } catch (_) { pvFail(p); }
+}
+function pvFail(p) {
+  if (p.dead) return;
+  p.dead = true;
+  clearTimeout(p.tm);
+  p.v.pause();
+  p.v.removeAttribute('src');
+  try { p.v.load(); } catch (_) { /* нечего освобождать */ }
+}
+function pvHide() {
+  H.on = false;
+  clearTimeout(H.tm);
+  if (PV) PV.want = null;
+  $('#vpv').hidden = true;
+}
+function pvStop() { pvHide(); if (PV) { pvFail(PV); PV = null; } }
+function pPop(t, clientX) { H.on = true; H.x = clientX; pvFrame(); }
+
+vv.addEventListener('play', () => { cancelAnimationFrame(P.raf); P.watchAt = performance.now(); P.raf = requestAnimationFrame(pTick); });
+vv.addEventListener('playing', () => { P.playing = true; P.watchAt = performance.now(); });
+vv.addEventListener('waiting', () => { pWatch(); P.playing = false; });
+vv.addEventListener('pause', () => { pWatch(); P.playing = false; pUi(); });
 vv.addEventListener('timeupdate', () => { if (!P.drag) pUi(); });
-vv.addEventListener('loadedmetadata', pUi);
+vv.addEventListener('loadedmetadata', pMetadata);
 vv.addEventListener('loadeddata', () => clearTimeout(P.loadT));
-vv.addEventListener('seeked', () => {
-  if (P.seekT !== null) { const t = P.seekT; P.seekT = null; pSeekTo(t); }
-});
+vv.addEventListener('ended', pEnded);
+vv.addEventListener('seeked', () => { if (P.seekT !== null) { const t = P.seekT; P.seekT = null; pSeekTo(t); } });
 vv.addEventListener('error', () => { if (vv.error && P.id !== null) pFail(); });
-vv.onclick = pToggle;
+$('#vi').addEventListener('load', pLayout);
 $('#vplay').onclick = pToggle;
 $('#vmute').onclick = pMute;
-$('#vrate').onclick = () => pRateBy(pRate >= 2 ? -RATES.length : 1);
+$('#vrate').onclick = () => pRateBy(1, true);
 $('#vvol').oninput = e => {
   pVol = +e.target.value;
   pMuted = pVol === 0;
-  store.set('vol', pVol);
+  store.set('vol', String(pVol));
   store.set('mute', pMuted ? '1' : '0');
   pApplyVol();
 };
 $('#vvol').onchange = e => e.target.blur();
-$('#vhere').onclick = () => (P.on ? playerOff() : playerOn());
+$('#vhere').onclick = () => { if (P.on) playerOff(); else if (player.external) openCur(); else playerOn(); };
 $('#vfext').onclick = openCur;
+$('#vrestart').onclick = () => { pSeekTo(0); $('#vmsg').hidden = true; };
+$('#vtlb').onclick = tlToggle;
+$('#vauto').onclick = () => { pAuto = !pAuto; store.set('auto', pAuto ? '1' : '0'); pControls(); };
+$('#vnextEnd').onclick = () => { pNext = !pNext; store.set('next', pNext ? '1' : '0'); pControls(); };
+$('#vloop').onclick = () => { pLoop = !pLoop; store.set('loop', pLoop ? '1' : '0'); pControls(); };
 
-// шкала: клик и перетаскивание — перемотка; над шкалой — клетка листа превью для этого момента
 const seek = $('#vseek');
-const seekT = e => {
-  const r = seek.getBoundingClientRect();
-  return clamp((e.clientX - r.left) / r.width, 0, 1) * pDur();
-};
+const seekT = e => { const r = seek.getBoundingClientRect(); return clamp((e.clientX - r.left) / Math.max(1, r.width), 0, 1) * pDur(); };
 seek.onpointerdown = e => {
   if (e.button !== 0 || !pDur()) return;
-  try { seek.setPointerCapture(e.pointerId); } catch (_) { /* без захвата перетаскивание за край оборвётся */ }
+  try { seek.setPointerCapture(e.pointerId); } catch (_) { /* без захвата остановится у края */ }
   P.drag = true;
   pSeekTo(seekT(e));
 };
-seek.onpointermove = e => {
-  if (!pDur()) return;
-  const t = seekT(e);
-  if (P.drag) pSeekTo(t);
-  pPop(t, e.clientX);
-};
-seek.onpointerup = () => { P.drag = false; };
-seek.onpointerleave = () => { if (!P.drag) $('#vpop').hidden = true; };
-function pPop(t, clientX) {
-  const it = items[cur], pop = $('#vpop'), box = seek.getBoundingClientRect(), PW = 240;
-  if (!it || P.id !== it.id) return;
-  if (P.infoFor !== it.id && ff.ok && it.nv === 1) {  // сетка листа — один запрос на видео; без ffmpeg только время
-    P.infoFor = it.id;
-    P.info = P.L = null;
-    api('/api/cut/info', true, {id: it.id})
-      .then(i => { if (P.infoFor === it.id) { P.info = i; P.L = sheetLayout(i); } })
-      .catch(() => {});
-  }
-  pop.hidden = false;
-  $('#vptile').hidden = !P.L;
-  if (P.L) paintTile($('#vptile'), P.L, P.info, t, pDur(), PW);
-  $('#vptime').textContent = fmtT(t, true);
-  const w = P.L ? PW + 10 : pop.offsetWidth;
-  pop.style.left = clamp(clientX - box.left - w / 2, 0, Math.max(0, box.width - w)) + 'px';
+seek.onpointermove = e => { if (pDur()) { const t = seekT(e); if (P.drag) pSeekTo(t); pPop(t, e.clientX); } };
+seek.onpointerup = () => { P.drag = false; pvHide(); };
+seek.onpointercancel = () => { P.drag = false; pvHide(); };
+seek.onpointerleave = () => { if (!P.drag) pvHide(); };
+$('#vtl').onpointermove = e => { TLH.on = true; TLH.x = e.clientX; tlHover(); };
+$('#vtl').onpointerleave = () => { TLH.on = false; $('#vtlt').hidden = true; };
+$('#vtl').onclick = e => { if (e.button === 0 && P.L) pSeekTo(tlTime(e.clientX, pDur())); };
+$('#v').addEventListener('mousemove', barShow);
+$('#vstage').addEventListener('wheel', e => {
+  if (C) return;
+  e.preventDefault();
+  const now = performance.now();
+  if (!e.deltaY || now - P.wheelAt < 120) return;
+  P.wheelAt = now;
+  vGo(cur + (e.deltaY > 0 ? 1 : -1));
+}, {passive: false});
+function vClick(e) {
+  if (C || e.button !== 0) return;
+  clearTimeout(P.clickT);
+  if (e.detail > 1) return;
+  const video = e.currentTarget === vv;
+  P.clickT = setTimeout(() => { if (viewer && !C) { if (video) pToggle(); else closeViewer(); } }, 250);
 }
+function vDouble(e) { if (!C) { clearTimeout(P.clickT); e.preventDefault(); toggleFs(); } }
+vv.onclick = vClick;
+vv.ondblclick = vDouble;
+$('#vi').ondblclick = vDouble;
+addEventListener('resize', () => { if (viewer) { tlApply(); if (H.on) pvFrame(); } });
+addEventListener('pagehide', () => { pWatch(); pProgress(true); pvStop(); });
 
 /* ───── обрезка видео (без перекодирования) ───── */
 
@@ -4053,6 +4927,8 @@ function pPop(t, clientX) {
 // cutSt — состояние обрезки на сервере (идёт в фоне, ход — в шапке, в #jobbar)
 let cutTimer = 0, frameTimer = 0, frameBusy = false, frameWant = null, cutSt = {running: false};
 const track = $('#ctrack');
+// это видео сейчас режется или ждёт в очереди обрезки (его нельзя играть, удалять и снова ставить в очередь)
+const trimBusy = id => (cutSt.running && cutSt.id === id) || (cutSt.queue || []).some(t => t.id === id);
 
 const fmtT = (t, fine) => {
   const s = Math.max(0, t), h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
@@ -4076,8 +4952,7 @@ async function openCut() {
   if (!it.nv) { toast('This preview has no video', true); return; }
   if (it.nv > 1) { toast('Several video files share this name: unclear which one to trim', true); return; }
   if (!ff.ok) { toast('ffmpeg not found: cannot trim', true); return; }
-  if (job.running) { toast('Previews are being created: trim after it finishes', true); return; }
-  if (cutSt.running) { toast('Another video is being trimmed: wait until it finishes', true); return; }
+  if (trimBusy(it.id)) { toast('This video is already in the trimming queue', true); return; }
   if (P.on) playerOff();  // обрезке нужен лист превью, а файл видео не должен быть занят плеером
   let info;
   try {
@@ -4219,17 +5094,17 @@ function delCut() {
   C.sel = -1;
   renderCut();
 }
-// выбранный кусок становится единственным, что останется: удаляется всё до него и после него
-function keepOnly() {
-  if (C.sel < 0) { toast('Drag over the part to keep, then press Keep only this'); return; }
-  const k = C.cuts[C.sel];
-  C.cuts = [];
-  if (k.a >= 0.2) C.cuts.push({a: 0, b: k.a});
-  if (C.d - k.b >= 0.2) C.cuts.push({a: k.b, b: C.d});
-  C.sel = -1;
-  C.mark = null;
-  if (!C.cuts.length) toast('The piece covers the whole video: nothing to remove');
-  renderCut();
+// K: сразу обрезать, оставив только выбранный кусок (удаляется всё до него и после него)
+function keepOnlyStart() {
+  if (C.sel < 0) { toast('Drag over the part to keep, then press Keep only this (K)'); return; }
+  const k = C.cuts[C.sel], cuts = [];
+  if (k.a >= 0.2) cuts.push({a: 0, b: k.a});
+  if (C.d - k.b >= 0.2) cuts.push({a: k.b, b: C.d});
+  if (!cuts.length) { toast('The piece covers the whole video: nothing to remove'); return; }
+  const it = items.find(x => x.id === C.id), name = it ? full(it) : C.info.file;
+  submitCut(cuts, 'Keep only ' + fmtT(k.a, true) + ' – ' + fmtT(k.b, true) + ' of "' + name + '"?\n' +
+    'Everything before and after it is removed: about ' + fmtT(k.b - k.a) + ' of ' + fmtT(C.d) + ' stays' +
+    (k.a >= 0.2 ? ' (it starts at the nearest keyframe before ' + fmtT(k.a) + ')' : '') + '.\n');
 }
 
 /* всплывающий кадр над шкалой: сразу — клетка из листа превью, через миг — точный кадр от ffmpeg */
@@ -4329,7 +5204,7 @@ function cutKey(e) {
     case 'End': moveCur(C.d); break;
     case 'KeyI': C.mark = C.cur; renderCut(); break;
     case 'KeyO': cutOut(); break;
-    case 'KeyK': keepOnly(); break;
+    case 'KeyK': keepOnlyStart(); break;
     case 'Delete': case 'Backspace': delCut(); break;
     case 'Escape':
       if (C.mark !== null) C.mark = null;
@@ -4347,32 +5222,51 @@ async function startCut() {
   if (!C || !C.cuts.length) return;
   const it = items.find(x => x.id === C.id), n = C.cuts.length;
   const kept = C.d - C.cuts.reduce((s, c) => s + removedOf(c), 0);
-  if (!await ask('Trim "' + (it ? full(it) : C.info.file) + '"?\n' +
-      fmtT(kept) + ' of ' + fmtT(C.d) + ' will stay (removing ' + n + ' ' + plural(n, ['piece', 'pieces']) + ').\n' +
-      'Trimming runs in the background: you can keep browsing, progress is shown at the top.\n' +
-      'No re-encoding: kept pieces start at the nearest keyframe, so up to a couple of extra seconds may stay.\n' +
+  submitCut(C.cuts, 'Trim "' + (it ? full(it) : C.info.file) + '"?\n' +
+    fmtT(kept) + ' of ' + fmtT(C.d) + ' will stay (removing ' + n + ' ' + plural(n, ['piece', 'pieces']) + ').\n' +
+    'No re-encoding: kept pieces start at the nearest keyframe, so up to a couple of extra seconds may stay.\n');
+}
+// подтвердить и поставить обрезку в очередь: режется в фоне, по одной; панель сразу закрывается
+async function submitCut(cuts, text) {
+  const busy = cutSt.running ? 'Another video is being trimmed: this one waits in the queue.\n'
+    : job.running ? 'Previews are being created: trimming starts after that.\n' : '';
+  if (!await ask(text + busy + 'Trimming runs in the background: you can keep browsing and trim other videos, progress is shown at the top.\n' +
       'The original goes to _to_delete, Ctrl+Z restores it together with the old preview. The preview will be recreated.', 'Trim')) return;
   if (!C) return;
   try {
-    cutSt = await api('/api/cut/start', true, {id: C.id, cuts: C.cuts.map(c => [c.a, c.b])});
+    cutSt = await api('/api/cut/start', true, {id: C.id, cuts: cuts.map(c => [c.a, c.b])});
   } catch (e) {
     toast('Not trimmed: ' + e.message, true);
     return;
   }
-  closeCut(true);  // обрезка идёт в фоне: просмотр, папки и остальное свободны, ход — в шапке
+  closeCut(true);
   renderCutBar();
   cutWatch();
 }
 // ход обрезки: полоска в шапке и короткая строка в нижней панели просмотра (просмотр закрывает шапку)
+let cutSeen = -1;           // номер последнего показанного итога обрезки (cutSt.seq)
 function renderCutBar() {
-  const s = cutSt;
-  $('#cutbar').hidden = $('#vtrim').hidden = !s.running;
+  const s = cutSt, q = s.queue || [];
+  const it = viewer ? items[cur] : null, qi = it ? q.findIndex(t => t.id === it.id) : -1;
+  $('#cutbar').hidden = !s.running;
+  $('#vtrim').hidden = !s.running;
   if (!s.running) return;
+  const st = s.id == null ? 'finishing…' : (s.stage || 'preparing') + (s.stage === 'cutting' ? ' ' + (s.pct || 0) + '%' : '') +
+    (s.stopped ? ' (stopping…)' : '…');
+  const more = q.length ? ' · queued: ' + q.length : '';
   $('#cbar').style.width = (s.stage === 'cutting' || s.stage === 'replacing the file' ? s.pct || 0 : 0) + '%';
-  const st = (s.stage || 'preparing') + (s.stage === 'cutting' ? ' ' + (s.pct || 0) + '%' : '') + (s.stopped ? ' (stopping…)' : '…');
-  $('#cptxt').textContent = 'Trimming ' + s.name + ': ' + st;
-  $('#vtrimt').textContent = 'Trimming: ' + st;
-  $('#vtrimt').title = s.name;
+  $('#cptxt').textContent = (s.id != null ? 'Trimming ' + s.name + ': ' : 'Trimming: ') + st + more;
+  $('#cstop').title = 'Stop trimming' + (q.length ? ' and clear the queue' : '') + ': the videos stay unchanged';
+  if (qi >= 0) {
+    $('#vtrimt').textContent = 'Queued for trimming (#' + (qi + 1) + ')';
+    $('#vtstop').textContent = 'Cancel';
+    $('#vtstop').title = 'Remove this video from the trimming queue';
+  } else {
+    $('#vtrimt').textContent = (it && s.id === it.id ? 'Trimming: ' : 'Trimming ' + (s.name || '') + ': ') + st + more;
+    $('#vtstop').textContent = 'Stop';
+    $('#vtstop').title = 'Stop trimming this video: it stays unchanged';
+  }
+  $('#vtrimt').title = s.name || '';
 }
 function cutWatch() { if (!cutTimer) cutTimer = setTimeout(cutTick, 500); }
 async function cutTick() {
@@ -4386,10 +5280,15 @@ async function cutTick() {
   }
   cutSt = s;
   renderCutBar();
-  if (s.running) { cutWatch(); return; }
-  if (s.error) { toast('Not trimmed: ' + s.error, true); return; }
-  toast('Trimmed: ' + s.name + '. ' + (s.note || 'Recreating the preview…'), !!s.note);
-  await load().catch(() => {});  // без перехода к обрезанному: пользователь мог уйти в другую папку
+  let reload = false;
+  for (const r of (s.last || [])) {
+    if (r.seq <= cutSeen) continue;
+    cutSeen = r.seq;
+    if (r.error) toast('Not trimmed: ' + r.name + ': ' + r.error, true);
+    else { toast('Trimmed: ' + r.name + '. ' + (r.note || 'Recreating the preview…'), !!r.note); reload = true; }
+  }
+  if (reload) await load().catch(() => {});  // без перехода к обрезанному: пользователь мог уйти в другую папку
+  if (cutSt.running) cutWatch();
 }
 
 $('#chead').onclick = () => { if (C.cur > 0.2) addCut(0, C.cur); else toast('Put the cursor where the wanted part begins'); };
@@ -4398,10 +5297,17 @@ $('#cin').onclick = () => { C.mark = C.cur; renderCut(); };
 $('#cout').onclick = cutOut;
 $('#cdel').onclick = delCut;
 $('#cclr').onclick = () => { C.cuts = []; C.sel = -1; C.mark = null; renderCut(); };
-$('#conly').onclick = keepOnly;
+$('#conly').onclick = keepOnlyStart;
 $('#cgo').onclick = startCut;
-$('#cstop').onclick = $('#vtstop').onclick = () => api('/api/cut/stop', true).then(s => { cutSt = s; renderCutBar(); })
+// в шапке — остановить всё; в просмотре — только это видео (текущая обрезка или место в очереди)
+const cutStop = body => api('/api/cut/stop', true, body).then(s => { cutSt = s; renderCutBar(); })
   .catch(e => toast('Not stopped: ' + e.message, true));
+$('#cstop').onclick = () => cutStop({});
+$('#vtstop').onclick = () => {
+  const it = viewer ? items[cur] : null, q = cutSt.queue || [];
+  const id = it && q.some(t => t.id === it.id) ? it.id : cutSt.id;
+  if (id != null) cutStop({id});
+};
 $('#cexit').onclick = () => closeCut();
 
 /* ───── действия ───── */
@@ -4430,7 +5336,12 @@ async function load(focusId) {
     if (!all.length && videos.length) setMode('videos');
   }
   if (job.running) { wasRunning = true; watchJob(); }
-  if (j.cut) { cutSt = j.cut; renderCutBar(); if (j.cut.running) cutWatch(); }
+  if (j.cut) {
+    cutSt = j.cut;
+    if (cutSeen < 0) cutSeen = j.cut.seq || 0;  // итоги до открытия страницы не показываем
+    renderCutBar();
+    if (j.cut.running) cutWatch();
+  }
 }
 
 // пометить превью ошибкой и показать её на плитке, в просмотре и во всплывающем сообщении
@@ -4506,6 +5417,8 @@ async function removeCur() {
 async function undoLast() {
   if (!undoN || busy) return;
   busy = true;
+  // отменяемая запись может вернуть другой файл на место играющего (обрезка): отпустить его и сохранить позицию до отмены
+  if (P.id !== null) pRelease();
   try {
     const j = await api('/api/undo', true);
     if (j.trash) { trashInfo = j.trash; trashStat(); }
@@ -4515,6 +5428,7 @@ async function undoLast() {
   } catch (e) {
     toast('Not undone: ' + e.message, true);
     if (e.resync) await load().catch(() => {});
+    else if (viewer) showViewer();  // видео отпустили до отмены — вернуть его в плеер
   }
   busy = false;
 }
@@ -4533,6 +5447,7 @@ async function openCur() {
 /* ───── события ───── */
 
 grid.onclick = e => {
+  zone = 'grid';
   const f = e.target.closest('figure');
   if (!f) return;
   const i = items.findIndex(x => x.id === +f.dataset.id);
@@ -4541,7 +5456,7 @@ grid.onclick = e => {
   if (e.target.closest('.pk')) { togglePick(i, e.shiftKey); return; }
   const b = e.target.closest('button');
   if (b) {
-    if (b.dataset.a === 'open') openCur();
+    if (b.dataset.a === 'open') playItem(i);
     else if (b.dataset.a === 'del') removeCur();
   } else if (e.target.closest('.im')) {
     if (e.shiftKey) togglePick(i, true);
@@ -4550,26 +5465,71 @@ grid.onclick = e => {
   }
 };
 $('#dirs').onclick = e => {
-  const b = e.target.closest('button.dir');
-  if (b) setFolder(b.dataset.d);
+  const row = e.target.closest('.tr');
+  if (!row) return;
+  zone = 'tree';
+  const d = row.dataset.d, hasKids = !row.querySelector('.ta').classList.contains('no');
+  if (e.target.closest('.ta') && hasKids) {
+    if (d !== '') {
+      if (openDirs.has(d)) openDirs.delete(d); else openDirs.add(d);
+      saveOpen();
+    }
+    renderTree();
+    return;
+  }
+  if (hasKids && !openDirs.has(d)) { openDirs.add(d); saveOpen(); }
+  setFolder(d);
+};
+addEventListener('pointerdown', e => {
+  if (zone === 'tree' && !e.target.closest('#tree,#ctx,#dlg')) { zone = 'grid'; syncZone(); }
+}, true);
+$('#crumbs').onclick = e => {
+  const cr = e.target.closest('.cr');
+  if (cr) { setFolder(cr.dataset.d); return; }
+  if (e.target.closest('.xpl')) folderExplorer(folder);
+};
+$('#tsrt').value = tsort;
+$('#tsdir').textContent = tdesc ? '↓' : '↑';
+$('#tsrt').onchange = e => {
+  tsort = e.target.value;
+  tdesc = sortDesc(tsort);
+  store.set('tsort', tsort);
+  store.set('tdesc', tdesc ? '1' : '0');
+  $('#tsdir').textContent = tdesc ? '↓' : '↑';
+  renderTree();
+  e.target.blur();
+};
+$('#tsdir').onclick = () => {
+  tdesc = !tdesc;
+  store.set('tdesc', tdesc ? '1' : '0');
+  $('#tsdir').textContent = tdesc ? '↓' : '↑';
+  renderTree();
 };
 document.addEventListener('click', e => { const b = e.target.closest('button'); if (b) b.blur(); });
 
-$('#prev').onclick = () => go(cur - 1);
-$('#next').onclick = () => go(cur + 1);
-$('#pdir').onclick = () => crossFolder(-1, false);
-$('#ndir').onclick = () => crossFolder(1, false);
+$('#vprev').onclick = () => vGo(cur - 1);
+$('#vnext').onclick = () => vGo(cur + 1);
 $('#vopen').onclick = openCur;
 $('#vdel').onclick = removeCur;
 $('#vclose').onclick = () => closeViewer();
-$('#vi').onclick = () => { if (!C) closeViewer(); };   // клик по открытому на весь экран превью возвращает обычную ленту
+$('#vi').onclick = vClick;
 $('#vcut').onclick = openCut;
 $('#vpk').onclick = () => { if (items[cur]) togglePick(cur, false); };
 $('#und').onclick = undoLast;
 $('#tg').onclick = () => { treeOn = !treeOn; store.set('tree', treeOn ? '1' : '0'); renderTree(); };
 
-$('#srt').value = sort;
-$('#srt').onchange = e => { sort = e.target.value; store.set('srt', sort); applyView(); e.target.blur(); };
+const sortUi = () => { $('#srt').value = sort; $('#sdir').textContent = sdesc ? '↓' : '↑'; };
+sortUi();
+$('#srt').onchange = e => {
+  sort = e.target.value;
+  sdesc = sortDesc(sort);
+  store.set('srt', sort);
+  store.set('sdesc', sdesc ? '1' : '0');
+  sortUi();
+  applyView();
+  e.target.blur();
+};
+$('#sdir').onclick = () => { sdesc = !sdesc; store.set('sdesc', sdesc ? '1' : '0'); sortUi(); applyView(); };
 $('#deep').checked = deep;
 $('#deep').onchange = e => { deep = e.target.checked; store.set('deep', deep ? '1' : '0'); refreshView(); e.target.blur(); };
 const sz = $('#sz');
@@ -4586,6 +5546,8 @@ setHH();
 addEventListener('resize', setHH);
 if (window.ResizeObserver) new ResizeObserver(setHH).observe(hdr);
 
+// клавиатура: общее (меню, окна, F5) — здесь; дальше разбирают viewerKey (просмотр), treeKey (дерево, когда
+// клавиатура у него: zone === 'tree') и gridKey (галерея). Каждая возвращает true, если клавиша обработана
 addEventListener('keydown', e => {
   if (!$('#ctx').hidden) {  // открыто контекстное меню: любая клавиша его закрывает, Esc больше ничего не делает
     ctxHide();
@@ -4603,7 +5565,6 @@ addEventListener('keydown', e => {
   }
   if (e.target.matches('select,input')) return;
   if (C && viewer) { cutKey(e); return; }
-  if (P.on && viewer && $('#ov').hidden && !e.altKey && !e.metaKey && pKey(e)) { e.preventDefault(); return; }
   if (!$('#ov').hidden) {  // открыто окно меню (донаты, обновление, клавиши): Esc закрывает, остальное не трогаем
     if (e.code === 'Escape') { e.preventDefault(); closeSheet(); }
     return;
@@ -4612,44 +5573,99 @@ addEventListener('keydown', e => {
     if (e.code === 'Escape') { $('#trashp').hidden = $('#rootp').hidden = $('#menup').hidden = true; e.preventDefault(); }
     return;
   }
-  if (mode !== 'previews') return;
-  const cols = getComputedStyle(grid).gridTemplateColumns.split(' ').length;
-  const step = viewer ? 1 : cols;
-  switch (e.code) {
-    case 'ArrowRight': go(cur + 1); break;
-    case 'ArrowLeft': go(cur - 1); break;
-    case 'ArrowDown': go(cur + step); break;
-    case 'ArrowUp': go(cur - step); break;
-    case 'Home': select(0); break;
-    case 'End': select(items.length - 1); break;
-    case 'Enter': case 'NumpadEnter': openCur(); break;
-    case 'Space': viewer ? closeViewer() : openViewer(); break;
-    case 'Escape':
-      if (viewer) closeViewer();
-      else if (picked.size) { picked.clear(); pickStat(); }
-      else return;
-      break;
-    case 'Delete': case 'Backspace':
-      if (!e.repeat) { if (!viewer && picked.size) deleteSelected(); else removeCur(); }
-      break;
-    case 'BracketLeft': crossFolder(-1, false); break;
-    case 'BracketRight': case 'PageDown': crossFolder(1, false); break;
-    case 'PageUp': crossFolder(-1, false); break;
-    case 'KeyX': if (items[cur]) togglePick(cur, false); break;
-    case 'KeyA': if (e.ctrlKey || e.metaKey) { items.forEach(i => picked.add(i.id)); pickStat(); } else return; break;
-    case 'KeyE': showCur(); break;
-    case 'KeyC': if (!viewer) return; openCut(); break;
-    case 'KeyP': if (!viewer || e.ctrlKey) return; playerOn(); break;
-    case 'KeyI':
-      if (!viewer) return;
-      document.body.classList.toggle('nobar');
-      store.set('nobar', document.body.classList.contains('nobar') ? '1' : '0');
-      break;
-    case 'KeyZ': if (e.ctrlKey || e.metaKey) undoLast(); else return; break;
-    default: return;
-  }
-  e.preventDefault();
+  if (viewer) { if (viewerKey(e)) e.preventDefault(); return; }
+  if (zone === 'tree' && treeKey(e)) { e.preventDefault(); return; }
+  if (mode === 'previews' && gridKey(e)) e.preventDefault();
 });
+
+/* ───── клавиши просмотра ───── */
+
+// клавиши крупного просмотра (лист превью и встроенный плеер); true — обработано
+function viewerKey(e) {
+  const k = e.code;
+  if (k === 'KeyZ' && (e.ctrlKey || e.metaKey) && !e.altKey) { if (!e.repeat) undoLast(); return true; }
+  if (e.altKey || e.metaKey) return false;
+  if (k === 'ArrowLeft' || k === 'ArrowRight') {
+    const dir = k === 'ArrowLeft' ? -1 : 1;
+    if (!e.ctrlKey && !e.shiftKey) { vGo(cur + dir); return true; }
+    if (P.on) { pSeekBy(dir * (e.ctrlKey ? (e.shiftKey ? 120 : 30) : 5)); return true; }
+    return false;
+  }
+  if (e.ctrlKey) return false;
+  switch (k) {
+    case 'Home': select(0); return true;
+    case 'End': select(items.length - 1); return true;
+    case 'ArrowUp': pVolBy(0.05); return true;
+    case 'ArrowDown': pVolBy(-0.05); return true;
+    case 'KeyM': if (!e.repeat) pMute(); return true;
+    case 'KeyT': if (!e.repeat) tlToggle(); return true;
+    case 'KeyI':
+      if (!e.repeat) {
+        document.body.classList.toggle('nobar');
+        store.set('nobar', document.body.classList.contains('nobar') ? '1' : '0');
+        pvHide();
+        tlApply();
+      }
+      return true;
+    case 'Delete': if (!e.repeat) removeCur(); return true;
+    case 'KeyX': if (!e.repeat && items[cur]) togglePick(cur, false); return true;
+    case 'KeyE': if (!e.repeat) showCur(); return true;
+    case 'KeyC': if (!e.repeat) openCut(); return true;
+    case 'BracketLeft': case 'PageUp': if (!e.repeat) vCross(-1); return true;
+    case 'BracketRight': case 'PageDown': if (!e.repeat) vCross(1); return true;
+    case 'Backslash': case 'IntlBackslash': closeViewer(); return true;
+    case 'Escape': if (P.on) playerOff(); else closeViewer(); return true;
+    case 'KeyP': if (!e.repeat) { if (P.on) playerOff(); else playerOn(); } return true;
+    case 'Space': if (!e.repeat) { if (P.on) pToggle(); else playerOn(); } return true;
+    case 'Enter': case 'NumpadEnter':
+      if (!e.repeat) { if (P.on) toggleFs(); else if (player.external) openCur(); else playerOn(); }
+      return true;
+    case 'Backspace': if (P.on) { pSeekTo(0); vTimeFlash(); } return true;
+    case 'Comma': case 'Period':
+      if (!P.on) return false;
+      if (e.shiftKey) pRateBy(k === 'Comma' ? -1 : 1);
+      else if (vv.paused) pSeekBy((k === 'Comma' ? -1 : 1) / 30);
+      return true;
+  }
+  return false;
+}
+
+/* ───── клавиши галереи ───── */
+
+// клавиши ленты превью (как в VO Media: Backspace и Alt+↑ — на уровень вверх, удаление — только Del); true — обработано
+function gridKey(e) {
+  if (e.altKey && e.code === 'ArrowUp') { parentFolder(); return true; }
+  if ((e.ctrlKey || e.metaKey) && !e.altKey) {  // Ctrl и Cmd (macOS): выделить всё, отменить
+    if (e.code === 'KeyA') { items.forEach(i => picked.add(i.id)); pickStat(); return true; }
+    if (e.code === 'KeyZ') { undoLast(); return true; }
+  }
+  if (e.altKey || e.metaKey) return false;
+  const cols = getComputedStyle(grid).gridTemplateColumns.split(' ').length;
+  switch (e.code) {
+    case 'ArrowRight': if (!e.ctrlKey) go(cur + 1); return !e.ctrlKey;
+    case 'ArrowLeft': if (!e.ctrlKey) go(cur - 1); return !e.ctrlKey;
+    case 'ArrowDown': go(cur + cols); return true;
+    case 'ArrowUp': go(cur - cols); return true;
+    case 'Home': select(0); return true;
+    case 'End': select(items.length - 1); return true;
+    case 'Enter': case 'NumpadEnter':
+      if (player.external) openCur(); else openViewer();
+      return true;
+    case 'Space': openViewer(); return true;
+    case 'Escape': if (picked.size) { picked.clear(); pickStat(); return true; } return false;
+    case 'Delete': if (!e.repeat) { if (picked.size) deleteSelected(); else removeCur(); } return true;
+    case 'Backspace': if (!e.repeat) parentFolder(); return true;
+    case 'BracketLeft': siblingFolder(-1); return true;
+    case 'BracketRight': siblingFolder(1); return true;
+    case 'PageUp': crossFolder(-1, false); return true;
+    case 'PageDown': crossFolder(1, false); return true;
+    case 'KeyX': if (e.ctrlKey) return false; if (items[cur]) togglePick(cur, false); return true;
+    case 'KeyA': if (e.ctrlKey || e.metaKey) { items.forEach(i => picked.add(i.id)); pickStat(); return true; } return false;
+    case 'KeyE': if (e.ctrlKey) return false; showCur(); return true;
+    case 'KeyZ': if (e.ctrlKey || e.metaKey) { undoLast(); return true; } return false;
+  }
+  return false;
+}
 
 /* ───── вкладки ───── */
 
@@ -5005,17 +6021,7 @@ function ask(text, okLabel) {
 
 const videoCount = () => all.filter(inView).reduce((s, i) => s + i.nv, 0) + videos.filter(inView).length;
 function folderStat() {
-  $('#fdel').disabled = !folder;
-  const n = videoCount(), name = player.name;
-  const p = $('#fplay'), b = $('#fmpc');
-  p.textContent = 'Play in ' + name + ' (' + n + ')';
-  p.disabled = b.disabled = !n;
-  p.title = 'Play all videos of the selected folder' + (deep ? ' and its subfolders' : '') + ' in ' + name +
-    (player.add ? ': the playlist is replaced and playback starts at once (like "Play with MPC-HC" in Explorer)' : '');
-  b.hidden = !player.add;
-  b.textContent = 'Add to ' + name + ' playlist';
-  b.title = 'Append the videos to the ' + name + ' playlist without starting playback (like "Add to playlist")';
-  $('#mplrt').textContent = 'Video player: ' + name;
+  $('#mplrt').textContent = 'Video player: ' + player.name;
 }
 async function mpcSend(body, add) {
   try {
@@ -5027,10 +6033,9 @@ async function mpcSend(body, add) {
   }
   folderStat();
 }
-$('#fplay').onclick = () => mpcSend({dir: folder, deep}, false);
-$('#fmpc').onclick = () => mpcSend({dir: folder, deep}, true);
-$('#fexp').onclick = () => {
-  api('/api/explorer', true, {dir: folder}).catch(e => toast('Not opened: ' + e.message, true));
+const folderPlay = (rel, add) => mpcSend({dir: rel, deep}, !!add);
+const folderExplorer = rel => {
+  api('/api/explorer', true, {dir: rel}).catch(e => toast('Not opened: ' + e.message, true));
 };
 function showCur() {
   const it = items[cur];
@@ -5081,15 +6086,15 @@ const openId = id => api('/api/open/' + id, true).then(() => toast('Opening the 
 
 addEventListener('contextmenu', e => {
   const win = player.os === 'win', addTo = 'Add to ' + player.name + ' playlist', show = SHOWF[player.os] || SHOWF.win;
-  const f = !viewer && e.target.closest('#grid figure');
+  const f = viewer ? !C && e.target.closest('#vstage') : e.target.closest('#grid figure');
   if (f) {
-    const i = items.findIndex(x => x.id === +f.dataset.id);
+    const i = viewer ? cur : items.findIndex(x => x.id === +f.dataset.id);
     if (i < 0) return;
     const it = items[i];
-    if (picked.has(it.id) && picked.size > 1) {  // правый клик по выделенной плитке — действия над всем выделением
+    if (!viewer && picked.has(it.id) && picked.size > 1) {  // правый клик по выделенной плитке — действия над всем выделением
       const sel = items.filter(x => picked.has(x.id)), ids = sel.map(x => x.id), wv = sel.filter(x => x.nv).map(x => x.id);
       ctxShow(e, 'Selected: ' + sel.length, [
-        {t: 'Play (' + wv.length + ')', off: !wv.length, f: () => mpcSend({ids: wv}, false)},
+        {t: 'Play in ' + player.name + ' (' + wv.length + ')', off: !wv.length, f: () => mpcSend({ids: wv}, false)},
         player.add && {t: addTo, off: !wv.length, f: () => mpcSend({ids: wv}, true)},
         {t: 'Copy paths', f: () => copyPaths({ids})},
         win && {t: 'Copy files', f: () => copyPaths({ids}, true)},
@@ -5099,9 +6104,10 @@ addEventListener('contextmenu', e => {
       ]);
       return;
     }
-    select(i, false);
+    if (!viewer) select(i, false);
     ctxShow(e, full(it), [
-      {t: 'Open video', off: !it.nv, f: openCur},
+      {t: 'Play here', off: !it.nv || (viewer && P.on), f: () => playItem(i, true)},
+      {t: 'Play in ' + player.name, off: !it.nv, f: openCur},
       player.add && {t: addTo, off: !it.nv, f: () => mpcSend({ids: [it.id]}, true)},
       {t: show, f: showCur},
       {t: 'Copy path', f: () => copyPaths({ids: [it.id]})},
@@ -5126,18 +6132,19 @@ addEventListener('contextmenu', e => {
     ]);
     return;
   }
-  const d = e.target.closest('#dirs button.dir');
+  const d = e.target.closest('#dirs .tr');
   if (d) {
     const rel = d.dataset.d;
-    setFolder(rel);  // меню относится к этой папке: она становится выбранной, пункты — те же, что кнопки под деревом
+    zone = 'tree';
+    setFolder(rel);  // меню относится к этой папке: она становится выбранной
     const n = videoCount();
     ctxShow(e, rel || ROOT, [
-      {t: 'Play in ' + player.name + ' (' + n + ')', off: !n, f: () => $('#fplay').click()},
-      player.add && {t: addTo, off: !n, f: () => $('#fmpc').click()},
-      {t: (OSL[player.os] || OSL.win)[0], f: () => $('#fexp').click()},
+      {t: 'Play in ' + player.name + ' (' + n + ')', off: !n, f: () => folderPlay(rel, false)},
+      player.add && {t: addTo, off: !n, f: () => folderPlay(rel, true)},
+      {t: (OSL[player.os] || OSL.win)[0], f: () => folderExplorer(rel)},
       {t: 'Copy path', f: () => copyPaths({dir: rel})},
-      '-',
-      {t: 'Delete folder…', del: true, off: !rel, f: () => $('#fdel').click()},
+      rel && '-',
+      rel && {t: 'Delete folder… (Del)', del: true, f: () => folderDelete(rel)},
     ]);
     return;
   }
@@ -5155,7 +6162,7 @@ function pickStat() {
   $('#sdel').textContent = 'Delete (' + n + ')';
   $('#sredo').textContent = 'Recreate previews (' + withVideo + ')';
   $('#sredo').disabled = !withVideo || job.running || !ff.ok;
-  $('#splay').textContent = 'Play (' + withVideo + ')';
+  $('#splay').textContent = 'Play in ' + player.name + ' (' + withVideo + ')';
   $('#splay').title = 'Play the selected videos in ' + player.name;
   $('#splay').disabled = !withVideo;
   if (viewer && items[cur]) $('#vpk').textContent = picked.has(items[cur].id) ? '✓ Selected' : 'Select (X)';
@@ -5215,12 +6222,13 @@ $('#splay').onclick = () => {
 
 function forgetDir(rel) {
   [...knownDirs].forEach(d => { if (d === rel || d.startsWith(rel + '/')) knownDirs.delete(d); });
+  [...openDirs].forEach(d => { if (d === rel || d.startsWith(rel + '/')) openDirs.delete(d); });
+  saveOpen();
   if (folder === rel || folder.startsWith(rel + '/')) folder = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
 }
 
-$('#fdel').onclick = async () => {
-  if (!folder) return;
-  const target = folder;
+async function folderDelete(target = folder) {
+  if (!target) { toast('The root folder cannot be deleted'); return; }
   let info;
   try {
     info = await api('/api/folder/info', true, {dir: target});
@@ -5246,7 +6254,7 @@ $('#fdel').onclick = async () => {
   } catch (e) {
     toast('Not deleted: ' + e.message, true);
   }
-};
+}
 
 $('#fempty').onclick = async () => {
   let r;
@@ -5282,9 +6290,8 @@ const OSL = {
 };
 function osLabels() {
   const l = OSL[player.os] || OSL.win;
-  $('#fexp').textContent = l[0];
-  $('#fexp').title = l[1];
   $('#kexp').textContent = l[2];
+  renderCrumbs();
 }
 let plData = null;
 function plRender() {
@@ -5292,6 +6299,9 @@ function plRender() {
   $('#plt').textContent = d.os === 'win'
     ? 'MPC-HC is recommended: only with it the gallery can add videos to the playlist and bring the player window to the front. Other players just play.'
     : 'The player opens the video, or a playlist of all videos when you play a folder or a selection.';
+  $('#plmode').innerHTML = [false, true].map(external => '<button data-external="' + external + '" class="' +
+    (!!player.external === external ? 'on' : '') + '"><span class="rd"></span><span class="pn">' +
+    (external ? esc(player.name) : 'Built-in player<span>plays right in the gallery</span>') + '</span></button>').join('');
   $('#pll').innerHTML = d.players.map((x, i) => '<button data-i="' + i + '" class="' + (x.id === d.current ? 'on' : '') + '">' +
     '<span class="rd"></span><span class="pn">' + esc(x.name) + '<span>' + esc(x.path) + '</span></span>' +
     (x.rec ? '<span class="badge">recommended</span>' : '') + '</button>').join('');
@@ -5307,11 +6317,17 @@ function playerSet(r) {
   if (plData) plData.current = r.path !== undefined ? r.path : plData.current;
   folderStat();
   pickStat();
+  if (viewer) showViewer();
 }
-$('#fplr').onclick = playerSheet;
 $('#mplr').onclick = playerSheet;
 $('#plclose').onclick = closeSheet;
 $('#plmpc').onclick = () => link('mpc');
+$('#plmode').onclick = async e => {
+  const b = e.target.closest('button[data-external]');
+  if (!b) return;
+  try { playerSet(await api('/api/player/set', true, {external: b.dataset.external === 'true'})); plRender(); }
+  catch (err) { toast('Failed: ' + err.message, true); }
+};
 $('#pll').onclick = async e => {
   const b = e.target.closest('button[data-i]');
   if (!b) return;
