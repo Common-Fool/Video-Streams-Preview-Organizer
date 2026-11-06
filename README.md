@@ -21,7 +21,7 @@ The whole program is a single Python file (`pairview.py`, standard library only)
 
   ![Trimming: two pieces marked in red on the timeline, a frame preview pops up over the contact sheet](assets/screenshot-trim.jpg)
 
-- **Built-in player.** Videos play right in the viewer: seek bar with a frame from the contact sheet (then the exact frame), a strip of frames (`T`), speed, frame stepping, autoplay, next video at the end, loop, and playback resumes where you stopped.
+- **Built-in player.** Videos play right in the viewer: seek bar with a frame from the contact sheet (then the exact frame), the contact sheet shown again while paused, speed, frame stepping, autoplay, next video at the end, loop, and playback resumes where you stopped.
 - **External player.** Play a folder, a selection or a single video in the player of your choice (menu ☰ → Video player: installed players are detected — MPC-HC, MPC-BE, VLC, PotPlayer, mpv, IINA, Celluloid…, or any program). MPC-HC is recommended on Windows: only with it videos can be appended to the playlist without starting playback, and the player window is brought to the front. Show any file in Explorer / Finder / the file manager.
 - **Folder switching.** The last opened folder reopens automatically; another one can be picked from the header (recent folders or a folder dialog) without restarting.
 - **Updates from GitHub.** The menu (☰) checks for a new release; one click downloads it, replaces the program (exe, app or AppImage) and restarts VO SP with the same folder. A green dot on the menu button means an update is available.
@@ -85,10 +85,9 @@ Persistent options can be put into `pairview.json` next to the program or in `%A
 
 | Where | Keys |
 |---|---|
-| Gallery | Arrows, `Home`/`End` — select; `Enter`/`Space` — open the preview sheet; `E` — show in Explorer / Finder; `Del` — delete video(s); `Backspace` — parent folder; `[` `]` — folder of the same level; `PgUp` `PgDn` — previous/next folder with videos; `X`, `Ctrl+A` — select tiles; `Ctrl+Z` — undo; `F5` — rescan |
+| Gallery | Arrows, `Home`/`End` — select; `Enter`/`Space`/click — open the viewer with the preview sheet; `E` — show in Explorer / Finder; `Del` — delete video(s); `Backspace` — parent folder; `[` `]` — folder of the same level; `PgUp` `PgDn` — previous/next folder with videos; `X`, `Ctrl+A` — select tiles; `Ctrl+Z` — undo; `F5` — rescan |
 | Folder tree | Click a folder, then `↑`/`↓` — move, `←`/`→` — collapse/expand, `Del` — delete the folder, `Esc` — back to the gallery |
-| Viewer | `←`/`→` — previous/next; `Space`/`Enter`/`P` — play the video here; `C` — trim; `I` — hide the bar; `Esc` — close |
-| Playing | `Space` — pause; `Shift`/`Ctrl`+`←`/`→` — seek 5 s / 30 s; `↑`/`↓` — volume; `T` — frame strip; `,` `.` — frame step; `P`/`Esc` — back to the sheet |
+| Viewer | `Space`/click — play / pause; `Enter`/double click — full screen; `←`/`→` — previous/next; `Shift`/`Ctrl`+`←`/`→` — seek 5 s / 30 s; `↑`/`↓` — volume; `,` `.` — frame step; `Backspace` — back to the start and the sheet; `Del` — delete; `I` — hide the bar; `Esc` — from the video to the sheet, from the sheet close |
 | Trimming | `←`/`→` — move cursor 1 s (`Shift` 10 s, `Ctrl` 1 min); `I`/`O` — start/end of a piece to remove; `K` — trim now, keeping only the selected piece; `Del` — unmark the selected piece; `Esc` — close |
 
 ## Building
