@@ -32,7 +32,6 @@ import atexit
 import errno
 import json
 import os
-import queue
 import re
 import secrets
 import socket
@@ -253,8 +252,8 @@ def delete_group(gid):
         g = GROUPS.get(gid)
     if g is None:
         raise Gone('this video is already gone — the list has been refreshed')
-    if gid in trim_busy():
-        raise Fail(TRIM_BUSY, 409)
+    if trim_release([gid]):  # ждало в очереди обрезки — убрано из неё; режется прямо сейчас — нельзя
+        raise Fail(trim_now(g['name']), 409)
     moved = []
     for path, root, *_ in g['v'] + g['p']:  # видео первым: его чаще держит плеер
         dst = ''
@@ -291,8 +290,8 @@ def delete_batch(ids, orphans_only=False):
     for gid, g in todo:
         # спрашиваем на каждой паре: обрезку могли запустить, пока переносились предыдущие. Если её запустят прямо сейчас,
         # данные не пострадают: cut_worker перед заменой проверит, что пара на месте, иначе оставит всё как было
-        if gid in trim_busy():
-            failed.append({'name': g['name'], 'error': TRIM_BUSY})
+        if trim_release([gid]):
+            failed.append({'name': g['name'], 'error': trim_now(g['name'])})
             continue
         moved = []
         path = dst = ''
@@ -359,6 +358,10 @@ def undo_last():
                 except OSError as e:
                     raise MoveError(src, e, dst)
         if g is None:  # запись о переносе папки целиком: сами файлы уже вернулись переименованием папки
+            continue
+        if g is MERGED:  # результат склейки ушёл в корзину: его пары больше нет, исходники вернут следующие записи
+            with LOCK:
+                GROUPS.pop(gid, None)
             continue
         with LOCK:
             for other in [i for i, x in GROUPS.items() if i != gid and x.get('key') == g.get('key')]:
@@ -577,16 +580,33 @@ TSTAT = {'files': 0, 'bytes': 0, 'ready': False, 'gen': 0}  # счётчик п�
 TLOCK = threading.Lock()
 
 
+def tree_files(top, skip=None):
+    """Файлы под top: (имя, размер). Размер берётся из записи scandir — в Windows он приходит вместе со списком
+    папки, без отдельного запроса на каждый файл (по SMB это тысячи лишних запросов). skip(имя) — пропустить подпапку."""
+    stack = [top]
+    while stack:
+        try:
+            it = os.scandir(stack.pop())
+        except OSError:
+            continue
+        with it:
+            for e in it:
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        if not (skip and skip(e.name)):
+                            stack.append(e.path)
+                        continue
+                    yield e.name, e.stat(follow_symlinks=False).st_size
+                except OSError:
+                    pass
+
+
 def trash_walk():
     files = size = 0
     for d in trash_dirs():
-        for dp, _dn, fn in os.walk(lp(d, tree=True)):
-            for f in fn:
-                try:
-                    size += os.path.getsize(os.path.join(dp, f))
-                    files += 1
-                except OSError:
-                    pass
+        for _f, n in tree_files(lp(d, tree=True)):
+            size += n
+            files += 1
     return files, size
 
 
@@ -1586,17 +1606,18 @@ def folder_info(rel):
         if not os.path.isdir(lp(base)):
             continue
         found = True
-        for dp, dn, fn in os.walk(lp(base, tree=True)):
-            dn[:] = [d for d in dn if d not in TRASH_NAMES and d[0] not in '.@#']  # системные папки в счёт не идут
-            dirs += len(dn)
-            for f in fn:
-                if f.lower() in JUNK_FILES:
-                    continue
-                try:
-                    size += os.path.getsize(os.path.join(dp, f))
-                    files += 1
-                except OSError:
-                    pass
+
+        def skip(d):  # системные папки в счёт не идут
+            nonlocal dirs
+            if d in TRASH_NAMES or d[0] in '.@#':
+                return True
+            dirs += 1
+            return False
+
+        for f, n in tree_files(lp(base, tree=True), skip):
+            if f.lower() not in JUNK_FILES:
+                size += n
+                files += 1
     if not found:
         raise Fail('folder not found on disk: ' + rel)
     with LOCK:
@@ -1623,9 +1644,11 @@ def delete_folder(rel):
     if busy:
         r = os.path.normcase(rel)  # в Windows Folder и folder — одна папка
         with LOCK:
-            dirs = [os.path.normcase(GROUPS[i]['dir']) for i in busy if i in GROUPS]
-        if any(d == r or d.startswith(r + os.path.normcase('/')) for d in dirs):  # normcase в Windows меняет / на \\
-            raise Fail('a video in this folder is being trimmed or waits in the trimming queue: wait or stop it', 409)
+            inside = {i for i in busy if i in GROUPS and (os.path.normcase(GROUPS[i]['dir']) == r or  # normcase меняет / на \\
+                      os.path.normcase(GROUPS[i]['dir']).startswith(r + os.path.normcase('/')))}
+        now = trim_release(inside)  # ждущие в очереди — убираются из неё, обрабатываемое сейчас — отказ
+        if now:
+            raise Fail('a video in this folder is being trimmed or merged right now: wait until it finishes or press Stop', 409)
     pairs = trash_folder(rel)
     if not pairs:
         raise Fail('folder not found on disk: ' + rel)
@@ -1837,8 +1860,15 @@ def probe(video, runner=None):
         start = float(fmt.get('start_time') or 0)
     except (TypeError, ValueError):
         start = 0.0
+    au = au or {}
     return {'duration': dur, 'start': start, 'bdelay': min(bdelay, 1.0), 'w': int(vs.get('width') or 0), 'h': int(vs.get('height') or 0),
-            'vcodec': vs.get('codec_name') or '?', 'pix': vs.get('pix_fmt') or '', 'acodec': (au or {}).get('codec_name') or '', 'fps': fps}
+            'vcodec': vs.get('codec_name') or '?', 'pix': vs.get('pix_fmt') or '', 'acodec': au.get('codec_name') or '', 'fps': fps,
+            # для склейки без перекодирования: у переменной частоты кадров avg_frame_rate свой у каждого файла, r_frame_rate — нет
+            'profile': vs.get('profile') or '', 'rfps': vs.get('r_frame_rate') or '',
+            'arate': au.get('sample_rate') or '', 'ach': au.get('channels') or 0,
+            # concat копирует пакеты как есть: у всех файлов должны совпадать база времени и набор звуковых дорожек
+            'vtb': vs.get('time_base') or '', 'atb': au.get('time_base') or '',
+            'nau': sum(1 for s in streams if s.get('codec_type') == 'audio')}
 
 
 def hms(sec):
@@ -1953,19 +1983,30 @@ def make_preview(g, work, jid, redo=False):
                 got.update(done)
                 if err:
                     last_err = err
-                if not done:  # пачка не дала ни одного кадра: дальше пачками не пробуем, остальное доберёт медленный путь
+                if done:
                     with GLOCK:
-                        FAST['bad'] += 1
+                        FAST['bad'] = 0  # пачки работают: сбой на одном битом файле не должен выключать их для всех
+                if not done:  # пачка не дала ни одного кадра: у этого видео дальше по одному (медленно)
+                    print('%s: frames in batches failed (%s), taking them one by one: this is slower' %
+                          (os.path.basename(video), last_line(err)))
+                    with GLOCK:
+                        FAST['bad'] += 1  # подряд у трёх видео — пачки на этой машине не работают вовсе
                         if FAST['bad'] >= 3 and FAST['on']:
                             FAST['on'] = False
-                            print('Fast rendering disabled (%s). Frames are taken one by one: this is slower.' % last_line(err))
+                            print('Fast rendering disabled: batches failed on 3 videos in a row. Frames are taken one by one.')
                     break
             if got and not FAST['said']:
                 FAST['said'] = True
                 print('Preview rendering: frames are taken in batches, about %d per ffmpeg run.' % per)
+        slow = n - len(got) > 5  # много кадров по одному: по сети это минуты — ход виден в строке «Now: …»
+        name = os.path.basename(video)
         for i in range(n):  # недостающие кадры (пачка не сработала, перемотка в «дыру» и т. п.) — по одному, как раньше
             if i in got:
                 continue
+            if slow:
+                with JLOCK:
+                    if jid in JOB['active']:
+                        JOB['active'][jid] = '%s (frames one by one: %d of %d)' % (name, len(got), n)
             t = times[i]
             # попытки: на видеокарте (если выбрана) → на процессоре → на процессоре с точной перемоткой чуть раньше
             for attempt in ((0, 1, 2) if hw else (1, 2)):
@@ -2049,12 +2090,25 @@ def make_preview(g, work, jid, redo=False):
         shutil.rmtree(jd, ignore_errors=True)
 
 
-def worker(q, work, redo=False):
-    while not STOP.is_set():
-        try:
-            gid = q.get_nowait()
-        except queue.Empty:
-            return
+# очередь создания превью; в неё можно дописывать, пока она идёт (под JLOCK): items — [(id, redo)], live — живые потоки
+JQ = {'items': [], 'live': 0, 'work': ''}
+
+
+def worker():
+    while True:
+        with JLOCK:
+            if STOP.is_set() or not JQ['items']:
+                JQ['live'] -= 1
+                if JQ['live'] > 0:
+                    return
+                # последний поток: очередь кончилась — здесь, под той же блокировкой, чтобы дописанное не потерялось
+                work, JQ['work'], JQ['items'] = JQ['work'], '', []
+                JOB['running'] = False
+                JOB['stopped'] = STOP.is_set()
+                ok, failed = JOB['ok'], len(JOB['failed'])
+                break
+            gid, redo = JQ['items'].pop(0)
+            work = JQ['work']
         with LOCK:
             g = GROUPS.get(gid)
         if g is None or not g['v'] or (g['p'] and not redo):
@@ -2076,7 +2130,7 @@ def worker(q, work, redo=False):
         except Cancelled:
             with JLOCK:
                 JOB['active'].pop(gid, None)
-            return
+            continue  # STOP взведён: следующий круг выйдет из очереди как положено
         except Fail as e:
             err = str(e)
         except Exception as e:  # noqa: BLE001 — одна поломка не должна останавливать всю очередь
@@ -2090,17 +2144,9 @@ def worker(q, work, redo=False):
                 JOB['ok'] += 1
             done, total = JOB['done'], JOB['total']
         print('[%d/%d] %s: %s' % (done, total, 'ERROR' if err else ('recreated' if redo else 'created'), err or name))
-
-
-def finish(threads, work):
-    for t in threads:
-        t.join()
-    shutil.rmtree(work, ignore_errors=True)
-    WORKDIRS.discard(work)
-    with JLOCK:
-        JOB['running'] = False
-        JOB['stopped'] = STOP.is_set()
-        ok, failed = JOB['ok'], len(JOB['failed'])
+    if work:
+        shutil.rmtree(work, ignore_errors=True)
+        WORKDIRS.discard(work)
     print('Preview creation %s: created %d, errors %d' % ('stopped' if STOP.is_set() else 'finished', ok, failed))
 
 
@@ -2115,32 +2161,41 @@ def start_job(ids, redo=False, internal=False):
         raise Fail('nothing to recreate: the selected previews have no video' if redo
                    else 'nothing to create: the selected videos already have previews')
     with JLOCK:
-        if JOB['running']:
-            raise Fail('preview creation is already running', 409)
         with CLOCK:
             if CUT['running'] and not internal:
                 raise Fail('videos are being trimmed: wait until it finishes or stop it', 409)
-        JOB.update(running=True, stopped=False, redo=bool(redo), total=len(todo), done=0, ok=0,
-                   failed={}, active={}, started=time.time())
-    STOP.clear()
-    try:
-        work = tempfile.mkdtemp(prefix='pairview_')
-        WORKDIRS.add(work)
-        if FF['drawtext'] and FF['font']:
-            shutil.copyfile(FF['font'], os.path.join(work, 'font.ttf'))
-    except OSError as e:
-        with JLOCK:
-            JOB['running'] = False
-        raise Fail('could not prepare a temporary folder: %s' % e)
-    q = queue.Queue()
-    for i in todo:
-        q.put(i)
-    threads = [threading.Thread(target=worker, args=(q, work, redo), daemon=True)
-               for _ in range(max(1, min(OPTS['jobs'], len(todo))))]
-    for t in threads:
-        t.start()
-    threading.Thread(target=finish, args=(threads, work), daemon=True).start()
-    print('%s previews: %d videos, threads: %d' % ('Recreating' if redo else 'Creating', len(todo), len(threads)))
+        if JOB['running']:  # очередь идёт — дописать в неё
+            if STOP.is_set():
+                raise Fail('preview creation is stopping: try again in a moment', 409)
+            queued = {i for i, _r in JQ['items']} | set(JOB['active'])
+            todo = [i for i in todo if i not in queued]
+            if not todo:
+                raise Fail('these videos are already in the queue', 409)
+            JQ['items'] += [(i, bool(redo)) for i in todo]
+            JOB['total'] += len(todo)
+            spawn = max(0, min(OPTS['jobs'], len(JQ['items']) + len(JOB['active'])) - JQ['live'])
+            JQ['live'] += spawn
+            added = True
+        else:
+            try:
+                work = tempfile.mkdtemp(prefix='pairview_')
+                WORKDIRS.add(work)
+                if FF['drawtext'] and FF['font']:
+                    shutil.copyfile(FF['font'], os.path.join(work, 'font.ttf'))
+            except OSError as e:
+                raise Fail('could not prepare a temporary folder: %s' % e)
+            STOP.clear()
+            JOB.update(running=True, stopped=False, redo=bool(redo), total=len(todo), done=0, ok=0,
+                       failed={}, active={}, started=time.time())
+            JQ.update(items=[(i, bool(redo)) for i in todo], work=work)
+            spawn = JQ['live'] = max(1, min(OPTS['jobs'], len(todo)))
+            added = False
+    for _ in range(spawn):
+        threading.Thread(target=worker, daemon=True).start()
+    if added:
+        print('Added to the preview queue: %d videos' % len(todo))
+    else:
+        print('%s previews: %d videos, threads: %d' % ('Recreating' if redo else 'Creating', len(todo), spawn))
 
 
 def stop_job():
@@ -2174,8 +2229,11 @@ def job_status():
 
 # running — очередь работает (в том числе ждёт создания превью); id/name/stage/pct/stopped — текущая обрезка;
 # seq/last — итоги готовых обрезок по порядку (страница показывает каждый один раз)
-CUT = {'running': False, 'id': None, 'name': '', 'stage': '', 'pct': 0, 'stopped': False, 'seq': 0, 'last': []}
-CUTQ = []     # ждущие обрезки: [{'id', 'name', 'regs'}] — режутся по одной, по порядку
+CUT = {'running': False, 'id': None, 'ids': [], 'kind': '', 'name': '', 'stage': '', 'pct': 0, 'stopped': False,
+       'seq': 0, 'last': []}
+# ждущие задачи, по одной и по порядку: обрезка {'kind': 'cut', 'id', 'ids': [id], 'name', 'regs'} и
+# склейка {'kind': 'merge', 'id': первый, 'ids': [...], 'name', 'clips': [{'id', 'regs'}]}
+CUTQ = []
 CLOCK = threading.Lock()
 CUTPROC = {'p': None}
 AFTER = {}    # номер пары -> функция(новое превью, [(старое, куда перенесено)]): её вызывает worker после пересоздания
@@ -2186,12 +2244,29 @@ MUXERS = {'.mp4': 'mp4', '.m4v': 'mp4', '.mov': 'mov', '.mkv': 'matroska', '.web
 TRIM_BUSY = 'this video is being trimmed or waits in the trimming queue: wait or stop it'
 
 
-def trim_busy():
-    """Номера пар, которые сейчас обрезают или которые ждут в очереди: их файлы нельзя удалять и возвращать."""
+def trim_release(ids):
+    """Перед удалением: видео, которые только ждут в очереди обрезки/склейки, убрать из неё (пользователь передумал —
+    удаление важнее). Вернуть номера тех, что обрабатываются прямо сейчас: их удалять нельзя."""
+    ids = set(ids)
     with CLOCK:
-        s = {t['id'] for t in CUTQ}
+        CUTQ[:] = [t for t in CUTQ if not (set(t['ids']) & ids)]
+        now = ids & set(CUT['ids']) if CUT['running'] and CUT['id'] is not None else set()
+        if now and CUT['stage'] == 'waiting for preview creation':  # ещё ничего не начато: задачу снимаем, итог молчит
+            CUT['stopped'] = 'deleted'
+            now = set()
+        return now
+
+
+def trim_now(name):
+    return '"%s" is being trimmed or merged right now: wait until it finishes or press Stop' % name
+
+
+def trim_busy():
+    """Номера пар, которые сейчас обрезают или склеивают или которые ждут в очереди: их файлы нельзя удалять и возвращать."""
+    with CLOCK:
+        s = {i for t in CUTQ for i in t['ids']}
         if CUT['running'] and CUT['id'] is not None:
-            s.add(CUT['id'])
+            s.update(CUT['ids'])
         return s
 
 
@@ -2323,7 +2398,33 @@ def cut_regions(info, cuts):
 
 
 def cut_plan(video, info, regs):
-    """Вырезаемые куски -> оставляемые [(начало, конец)], начало каждого — на ключевом кадре."""
+    """Вырезаемые куски -> оставляемые [(начало, конец)], начало каждого — на ключевом кадре (для обрезки)."""
+    plan, total = keep_plan(video, info, regs)
+    if total < 1:
+        raise Fail('nothing would be left of the video')
+    if info['duration'] - total < 0.5:
+        raise Fail('nothing to cut: the pieces are shorter than the keyframe interval')
+    return plan, total
+
+
+def concat_lines(video, info, plan):
+    """Строки ffconcat для оставляемых кусков одного файла."""
+    st, d = info['start'], info['duration']
+    lines = []
+    for a, b in plan:
+        lines.append("file '%s'" % video.replace("'", "'\\''"))
+        if a > 0:
+            lines.append('inpoint %.6f' % (st + a + 0.0005))  # чуть позже ключевого кадра: округление не уведёт на прежний
+        if b < d - 0.01:
+            # concat сравнивает outpoint со временем декодирования (dts): у видео с B-кадрами оно отстаёт от
+            # времени показа, и без поправки в кусок попадают лишние кадры, а на стыке время кадров совпадает
+            lines.append('outpoint %.6f' % (st + max(a + 0.04, b - info['bdelay'])))
+            lines.append('duration %.6f' % (b - a))  # иначе следующий кусок встанет раньше конца этого (на ту же задержку)
+    return lines
+
+
+def keep_plan(video, info, regs):
+    """Вырезаемые куски (может быть пусто — файл целиком) -> оставляемые и их общая длина."""
     d = info['duration']
     keep, pos = [], 0.0
     for a, b in regs:
@@ -2339,20 +2440,32 @@ def cut_plan(video, info, regs):
             plan[-1][1] = max(plan[-1][1], b)
         else:
             plan.append([a, b])
-    total = sum(b - a for a, b in plan)
-    if total < 1:
-        raise Fail('nothing would be left of the video')
-    if d - total < 0.5:
-        raise Fail('nothing to cut: the pieces are shorter than the keyframe interval')
-    return plan, total
+    return plan, sum(b - a for a, b in plan)
 
 
 def cut_status():
     with CLOCK:
         st = dict(CUT)
         st['last'] = list(CUT['last'])
-        st['queue'] = [{'id': t['id'], 'name': t['name']} for t in CUTQ]
+        st['ids'] = list(CUT['ids'])
+        st['queue'] = [{'id': t['id'], 'ids': list(t['ids']), 'kind': t['kind'], 'name': t['name']} for t in CUTQ]
         return st
+
+
+def cut_enqueue(task):
+    """Поставить задачу в очередь; нить очереди запускается, если она стоит."""
+    with CLOCK:
+        busy = {i for t in CUTQ for i in t['ids']} | (set(CUT['ids']) if CUT['running'] else set())
+        if busy & set(task['ids']):
+            raise Fail('this video is already in the trimming queue' if task['kind'] == 'cut'
+                       else 'some of these videos are being trimmed or merged or wait in the queue', 409)
+        CUTQ.append(task)
+        idle = not CUT['running']
+        if idle:
+            CUT.update(running=True, id=None, ids=[], kind='', name='', stage='', pct=0, stopped=False)
+    if idle:
+        threading.Thread(target=cut_loop, daemon=True).start()
+    return cut_status()
 
 
 def cut_start(gid, cuts):
@@ -2365,16 +2478,84 @@ def cut_start(gid, cuts):
     regs = cut_regions(info, cuts)
     if len(regs) == 1 and regs[0][0] <= 0.05 and regs[0][1] >= info['duration'] - 0.05:
         raise Fail('nothing would be left of the video')
-    with CLOCK:
-        if any(t['id'] == gid for t in CUTQ) or (CUT['running'] and CUT['id'] == gid):
-            raise Fail('this video is already in the trimming queue', 409)
-        CUTQ.append({'id': gid, 'name': os.path.basename(video), 'regs': regs})
-        idle = not CUT['running']
-        if idle:
-            CUT.update(running=True, id=None, name='', stage='', pct=0, stopped=False)
-    if idle:
-        threading.Thread(target=cut_loop, daemon=True).start()
-    return cut_status()
+    return cut_enqueue({'kind': 'cut', 'id': gid, 'ids': [gid], 'name': os.path.basename(video), 'regs': regs})
+
+
+MERGED = 'merged'  # вместо группы в записи отмены: эта пара — результат склейки, при отмене она исчезает
+
+
+def merge_probe(ids):
+    """Ролики для склейки по порядку: [(gid, группа, видео, данные ffprobe)]. Несовместимые — Fail с объяснением."""
+    if not (isinstance(ids, list) and len(ids) >= 2 and all(type(i) is int for i in ids) and len(set(ids)) == len(ids)):
+        raise Fail('choose at least two different videos to merge')
+    if not FF['ok']:
+        raise Fail('ffmpeg not found: cannot merge. Install ffmpeg or pass --ffmpeg PATH')
+    out = []
+    for gid in ids:
+        g, video = cut_target(gid)
+        if os.path.splitext(video)[1].lower() not in MUXERS:
+            raise Fail('cannot merge %s files' % os.path.splitext(video)[1])
+        out.append((gid, g, video, cut_probe(video)))
+
+    def sig(video, i):  # что должно совпасть, чтобы склеить без перекодирования
+        return [('file type', os.path.splitext(video)[1].lower()),
+                ('video', i['vcodec'] + (' ' + i['profile'] if i['profile'] else '')),
+                ('resolution', '%d×%d' % (i['w'], i['h'])),
+                ('pixel format', i['pix']),
+                ('frame rate', i['rfps']),
+                ('video time base', i['vtb']),
+                ('audio', '%s %s Hz, %s ch' % (i['acodec'], i['arate'], i['ach']) if i['acodec'] else 'no audio'),
+                ('audio time base', i['atb']),
+                ('audio tracks', str(i['nau']))]
+
+    base, bad = sig(out[0][2], out[0][3]), []
+    for n, (_gid, _g, video, info) in enumerate(out[1:], 2):
+        diff = ['%s %s instead of %s' % (k, v, b) for (k, v), (_k, b) in zip(sig(video, info), base) if v != b]
+        if diff:
+            bad.append('#%d "%s": %s' % (n, os.path.basename(video), ', '.join(diff)))
+    if bad:
+        raise Fail('these videos cannot be joined without re-encoding — ' + '; '.join(bad[:3]) +
+                   ('; and %d more' % (len(bad) - 3) if len(bad) > 3 else '') +
+                   ' (compared with #1 "%s")' % os.path.basename(out[0][2]))
+    return out
+
+
+def merge_info(ids):
+    """Данные для таймлайна склейки: по каждому ролику — как у cut_info()."""
+    clips = []
+    for gid, g, video, info in merge_probe(ids):
+        cols, rows, _fs, hh = sheet_grid(info)
+        clips.append({'id': gid, 'duration': info['duration'], 'w': info['w'], 'h': info['h'],
+                      'cols': cols, 'rows': rows, 'hh': hh, 'width': OPTS['width'], 'file': os.path.basename(video)})
+    first = clips[0]['file']
+    return {'clips': clips, 'out': merge_name(first)}
+
+
+def merge_name(first):
+    """Имя результата: <имя первого>_merged<расширение первого> (без проверки занятости — её делает склейка)."""
+    stem, ext = os.path.splitext(first)
+    return stem + '_merged' + ext
+
+
+def merge_start(clips):
+    """Поставить склейку в очередь: clips — [{id, cuts}] в порядке склейки, cuts — вырезаемые куски (может быть пусто)."""
+    if not isinstance(clips, list) or not all(isinstance(c, dict) for c in clips):
+        raise Fail('could not parse the request')
+    src = merge_probe([c.get('id') for c in clips])
+    task = []
+    for c, (gid, _g, video, info) in zip(clips, src):
+        cuts = c.get('cuts') or []
+        regs = cut_regions(info, cuts) if cuts else []
+        left, pos = 0.0, 0.0
+        for a, b in regs:
+            left += max(0.0, a - pos)
+            pos = max(pos, b)
+        left += max(0.0, info['duration'] - pos)
+        if left < 1:
+            raise Fail('nothing would be left of "%s": remove it from the merge instead' % os.path.basename(video))
+        task.append({'id': gid, 'regs': regs})
+    ids = [t['id'] for t in task]
+    return cut_enqueue({'kind': 'merge', 'id': ids[0], 'ids': ids, 'name': '%d videos' % len(ids), 'clips': task})
 
 
 def cut_stop(gid=None):
@@ -2383,8 +2564,8 @@ def cut_stop(gid=None):
         if gid is None:
             CUTQ.clear()
         else:
-            CUTQ[:] = [t for t in CUTQ if t['id'] != gid]
-        cur = CUT['running'] and CUT['id'] is not None and (gid is None or CUT['id'] == gid)
+            CUTQ[:] = [t for t in CUTQ if gid not in t['ids']]
+        cur = CUT['running'] and CUT['id'] is not None and (gid is None or gid in CUT['ids'])
         if cur:
             CUT['stopped'] = True
         p = CUTPROC['p'] if cur else None
@@ -2432,17 +2613,8 @@ def cut_one(gid, g, video, fmt, regs):
         with CLOCK:
             CUT['stage'] = 'finding keyframes'
         plan, total = cut_plan(video, info, regs)
-        st, d = info['start'], info['duration']
-        lines = ['ffconcat version 1.0']
-        for a, b in plan:
-            lines.append("file '%s'" % video.replace("'", "'\\''"))
-            if a > 0:
-                lines.append('inpoint %.6f' % (st + a + 0.0005))  # чуть позже ключевого кадра: округление не уведёт на прежний
-            if b < d - 0.01:
-                # concat сравнивает outpoint со временем декодирования (dts): у видео с B-кадрами оно отстаёт от
-                # времени показа, и без поправки в кусок попадают лишние кадры, а на стыке время кадров совпадает
-                lines.append('outpoint %.6f' % (st + max(a + 0.04, b - info['bdelay'])))
-                lines.append('duration %.6f' % (b - a))  # иначе следующий кусок встанет раньше конца этого (на ту же задержку)
+        d = info['duration']
+        lines = ['ffconcat version 1.0'] + concat_lines(video, info, plan)
         lst = os.path.join(work, 'list.txt')
         with open(lst, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines) + '\n')
@@ -2498,6 +2670,138 @@ def cut_one(gid, g, video, fmt, regs):
         WORKDIRS.discard(work)
 
 
+def merge_one(t):
+    """Склеить ролики в один без перекодирования; успех — (запись отмены, номер новой пары), сбой — Fail, всё как было."""
+    work = tempfile.mkdtemp(prefix='pairview_merge_')
+    WORKDIRS.add(work)
+    part = ''
+    try:
+        src = merge_probe([c['id'] for c in t['clips']])  # пока ждали, ролики могли удалить или заменить
+        with CLOCK:
+            CUT['stage'] = 'finding keyframes'
+        lines, total = ['ffconcat version 1.0'], 0.0
+        for c, (_gid, _g, video, info) in zip(t['clips'], src):
+            if cut_stopped():
+                raise Fail('merging stopped, the videos are unchanged')
+            plan, kept = keep_plan(video, info, c['regs'])
+            if kept < 1:
+                raise Fail('nothing would be left of "%s"' % os.path.basename(video))
+            lines += concat_lines(video, info, plan)
+            total += kept
+        fgid, fg, fvideo, _finfo = src[0]
+        stem, ext = os.path.splitext(fvideo)
+        # имя занято не только тем же файлом: видео с тем же именем и другим расширением (a_merged.mkv) — та же пара
+        try:
+            near = {os.path.splitext(x)[0].lower() for x in os.listdir(lp(os.path.dirname(fvideo)))
+                    if os.path.splitext(x)[1].lower() in VIDEO or os.path.splitext(x)[1].lower() in IGNORE}
+        except OSError:
+            near = set()
+
+        def taken(p):
+            nm = os.path.splitext(os.path.basename(p))[0].lower()
+            with LOCK:
+                pair = any(x.get('key') == (fg['key'][0], nm) and x['v'] for x in GROUPS.values())
+            return pair or nm in near or os.path.exists(lp(p)) or os.path.exists(lp(p + '.part'))
+
+        out, n = stem + '_merged' + ext, 1
+        while taken(out):
+            n += 1
+            out = '%s_merged (%d)%s' % (stem, n, ext)
+        part = out + '.part'
+        lst = os.path.join(work, 'list.txt')
+        with open(lst, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines) + '\n')
+        with CLOCK:
+            CUT['stage'] = 'merging'
+        cmd = [FF['ffmpeg'], '-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-f', 'concat', '-safe', '0',
+               '-i', lst, '-map', '0:v:0', '-map', '0:a?', '-c', 'copy', '-avoid_negative_ts', 'make_zero',
+               '-progress', 'pipe:1', '-nostats', '-f', MUXERS[ext.lower()], part]
+        print('Merging %d videos into %s (%s)' % (len(src), os.path.basename(out), hms(total)))
+        rc, ferr = cut_run(cmd, total, os.path.join(work, 'err.txt'))
+        if cut_stopped():
+            raise Fail('merging stopped, the videos are unchanged')
+        if rc != 0 or not os.path.exists(lp(part)) or os.path.getsize(lp(part)) == 0:
+            raise Fail('ffmpeg could not merge: ' + last_line(ferr))
+        new = probe(part, ff_call)
+        if abs(new['duration'] - total) > max(3.0, total * 0.02):
+            raise Fail('the result is %s long instead of %s — the videos are unchanged' % (hms(new['duration']), hms(total)))
+        with CLOCK:
+            CUT.update(stage='replacing the files', pct=100)
+        with LOCK:
+            for gid, g, video, _i in src:
+                if GROUPS.get(gid) is not g or not g['v'] or g['v'][0][0] != video:
+                    raise Fail('a video was deleted or renamed during merging — nothing has changed')
+        s2 = os.stat(lp(part))  # до переносов: после os.replace размер и время файла те же, а сбой здесь ничего не ломает
+        # исходники и их превью — в корзину (как при удалении); сбой — всё перенесённое обратно
+        recs, done = [], []
+
+        def fail(msg, code=400):
+            left = []
+            for s, b in reversed(done):
+                try:
+                    move(b, s)
+                except OSError:
+                    left.append((s, b))
+            if left:  # вернуть не вышло (файл заняли, сеть): оставшееся в корзине вернёт Ctrl+Z, пары убираются из списка
+                batch = []
+                with LOCK:
+                    for gid, g, _v, _i in src:
+                        own = {f[0] for f in g['v'] + g['p']}
+                        mv = [(s, b) for s, b in left if s in own]
+                        if mv:
+                            GROUPS.pop(gid, None)
+                            batch.append((gid, g, mv))
+                    UNDO.append(batch)
+                refresh_trash_stats()
+                msg += '. Could not move back: %s — it stays in _to_delete, Ctrl+Z returns it' % \
+                       ', '.join(os.path.basename(s) for s, _b in left[:3])
+            raise Fail(msg, code)
+
+        path = dst = ''
+        try:
+            for gid, g, _video, _i in src:
+                moved = []
+                for path, root, *_ in g['v'] + g['p']:
+                    dst = ''
+                    dst = trash_dst(path, root)
+                    move(path, dst)
+                    moved.append((path, dst))
+                    done.append((path, dst))
+                recs.append((gid, g, moved))
+        except OSError as e:
+            fail(explain(MoveError(path, e, dst)), 409)
+        try:
+            os.replace(lp(part), lp(out))
+        except OSError as e:
+            fail('could not write the merged video: %s' % (getattr(e, 'strerror', None) or e))
+        tstat_add(len(done), sum(f[2] for _gid, g, _v, _i in src for f in g['v'] + g['p']))
+        PROBES.clear()
+        root = fg['v'][0][1]
+        name = os.path.splitext(os.path.basename(out))[0]
+        ng = {'name': name, 'key': (fg['key'][0], name.lower()), 'dir': fg['dir'],
+              'v': [(out, root, s2.st_size, s2.st_mtime)], 'p': []}
+        rec = (None, MERGED, [], [(out, root)])  # отмена: склеенный — в корзину, пара исчезает; исходники — на место
+        with LOCK:
+            nid = new_id()
+            rec = (nid,) + rec[1:]
+            for gid, *_x in src:
+                GROUPS.pop(gid, None)
+            for other in [i for i, x in GROUPS.items() if x.get('key') == ng['key'] and not x['v']]:
+                ng['p'] += GROUPS.pop(other)['p']  # лежало превью с таким именем (без видео): теперь оно этой пары
+            GROUPS[nid] = ng
+            UNDO.append([rec] + recs)
+        print('Merged: %s, %s' % (os.path.basename(out), hms(new['duration'])))
+        return rec, nid, ng
+    finally:
+        try:
+            if part and os.path.exists(lp(part)):
+                os.remove(lp(part))
+        except OSError:
+            pass
+        shutil.rmtree(work, ignore_errors=True)
+        WORKDIRS.discard(work)
+
+
 def cut_loop():
     """Очередь обрезки, по одной. Обрезка и создание превью не идут вместе: каждая обрезка ждёт, пока создание
     закончится (в том числе пересоздание превью прошлой обрезки), а новое создание превью, пока очередь не пуста,
@@ -2505,11 +2809,14 @@ def cut_loop():
     while True:
         with CLOCK:
             if not CUTQ:
-                CUT.update(running=False, id=None, name='', stage='', pct=0, stopped=False)
+                CUT.update(running=False, id=None, ids=[], kind='', name='', stage='', pct=0, stopped=False)
                 return
             t = CUTQ.pop(0)
             gid = t['id']
-            CUT.update(id=gid, name=t['name'], stage='waiting for preview creation', pct=0, stopped=False)
+            CUT.update(id=gid, ids=list(t['ids']), kind=t['kind'], name=t['name'], stage='waiting for preview creation',
+                       pct=0, stopped=False)
+        merge = t['kind'] == 'merge'
+        stopped = 'merging stopped, the videos are unchanged' if merge else 'trimming stopped, the video is unchanged'
         err = note = ''
         try:
             while True:
@@ -2518,17 +2825,20 @@ def cut_loop():
                 if not busy:
                     break
                 if cut_stopped():
-                    raise Fail('trimming stopped, the video is unchanged')
+                    raise Fail(stopped)
                 time.sleep(0.3)
             if cut_stopped():
-                raise Fail('trimming stopped, the video is unchanged')
+                raise Fail(stopped)
             with CLOCK:
                 CUT['stage'] = 'preparing'
-            g, video = cut_target(gid)  # пока ждали, видео могли удалить или переименовать
-            fmt = MUXERS.get(os.path.splitext(video)[1].lower())
-            if not fmt:
-                raise Fail('cannot trim %s files' % os.path.splitext(video)[1])
-            rec = cut_one(gid, g, video, fmt, t['regs'])
+            if merge:
+                rec, gid, g = merge_one(t)
+            else:
+                g, video = cut_target(gid)  # пока ждали, видео могли удалить или переименовать
+                fmt = MUXERS.get(os.path.splitext(video)[1].lower())
+                if not fmt:
+                    raise Fail('cannot trim %s files' % os.path.splitext(video)[1])
+                rec = cut_one(gid, g, video, fmt, t['regs'])
 
             def after(out, moved, rec=rec):  # старое превью ушло в корзину, новое встало: отмена должна вернуть старое
                 rec[2].extend(moved)
@@ -2544,13 +2854,16 @@ def cut_loop():
             err = str(e)
         except Exception as e:  # noqa: BLE001 — одна поломка не должна останавливать очередь
             err = '%s: %s' % (type(e).__name__, e)
+        with CLOCK:
+            silent = CUT['stopped'] == 'deleted'  # видео удалили, пока задача ждала: сообщать нечего
         if err:
-            print('Trimming %s: %s' % (t['name'], err))
+            print('%s %s: %s' % ('Merging' if merge else 'Trimming', t['name'],
+                                 'cancelled, the video was deleted' if silent else err))
         with CLOCK:
             CUT['seq'] += 1
-            CUT['last'] = (CUT['last'] + [{'seq': CUT['seq'], 'id': gid, 'name': t['name'],
-                                           'error': err, 'note': note}])[-20:]
-            CUT.update(id=None, stage='', pct=0)
+            CUT['last'] = (CUT['last'] + [{'seq': CUT['seq'], 'id': gid, 'kind': t['kind'], 'name': t['name'],
+                                           'error': err, 'note': note, 'silent': silent}])[-20:]
+            CUT.update(id=None, ids=[], kind='', stage='', pct=0)
 
 
 # ───────────────────────── смена открытой папки ─────────────────────────
@@ -2678,7 +2991,7 @@ def choose_root(folder=None):
 
 # ───────────────────────── обновление с GitHub и поддержка проекта ─────────────────────────
 
-VERSION = '1.7'  # перед тегом vX.Y поднять: сборка релиза сверяет тег с этой строкой
+VERSION = '1.8'  # перед тегом vX.Y поднять: сборка релиза сверяет тег с этой строкой
 REPO = 'Common-Fool/Video-Streams-Preview-Organizer'
 LINKS = {  # внешние ссылки открываются только по имени отсюда (браузером по умолчанию)
     'github': 'https://github.com/' + REPO,
@@ -3221,6 +3534,10 @@ class Handler(BaseHTTPRequestHandler):
             elif post and p == ['api', 'cut', 'start']:
                 b = self.jbody(raw)
                 self.reply(200, cut_start(int(b.get('id', -1)), b.get('cuts')))
+            elif post and p == ['api', 'merge', 'info']:
+                self.reply(200, merge_info(self.jbody(raw).get('ids')))
+            elif post and p == ['api', 'merge', 'start']:
+                self.reply(200, merge_start(self.jbody(raw).get('clips')))
             elif post and p == ['api', 'cut', 'stop']:
                 gid = self.jbody(raw).get('id')
                 self.reply(200, cut_stop(gid if isinstance(gid, int) and not isinstance(gid, bool) else None))
@@ -3425,7 +3742,6 @@ body.notree #tree{display:none}
 #crumbs .cr:hover:not(:disabled){background:var(--ctlh);color:var(--text)}
 #crumbs .cur{padding:2px 7px;font-weight:600}
 #crumbs .sep{color:#555a6b}
-#crumbs .xpl{margin-left:auto;flex:none;padding:2px 9px;font-size:12px}
 #empty{margin:0;padding:28px 16px}
 
 #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(var(--w),100%),1fr));gap:16px;padding:18px}
@@ -3442,10 +3758,10 @@ figure.bad,figure.bad.sel{border-color:var(--bad);box-shadow:0 0 0 1px var(--bad
 .nov{position:absolute;right:8px;top:8px;padding:2px 9px;border-radius:20px;background:var(--bad);color:#fff;font-size:12px;font-weight:600}
 figcaption{padding:9px 12px 10px}
 .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
+figure .cap{display:flex;align-items:baseline;gap:12px}
+figure .cap .nm{flex:1;min-width:0}
+figure .cap>span{flex:none;font-size:12px;color:var(--dim);white-space:nowrap}
 .row{display:flex;align-items:center;gap:12px;min-height:30px;font-size:12px;color:var(--dim)}
-.bt{display:none;gap:6px;margin-left:auto}
-figure.sel .bt,figure:hover .bt{display:flex}
-.bt button{padding:3px 10px;font-size:12px}
 
 #v{position:fixed;inset:0;z-index:10;display:flex;flex-direction:column;background:var(--well);user-select:none}
 #v [hidden],#v[hidden]{display:none!important}
@@ -3465,9 +3781,10 @@ figure.sel .bt,figure:hover .bt{display:flex}
 #v:hover .vnav,#v:hover #vclose,#vstage:focus-within .vnav,#vstage:focus-within #vclose{opacity:.75}
 #v .vnav:hover,#v #vclose:hover{opacity:1;background:#000d}
 #vpanelbar{position:relative;flex:none;z-index:3;padding:6px 16px 10px;background:var(--panel);border-top:1px solid var(--line);transition:opacity .2s}
-#v.playing #vpanelbar{position:absolute;left:0;right:0;bottom:0;padding-top:28px;border:0;background:linear-gradient(transparent,#000e 55%);color:#fff}
-#v.playing.idle #vpanelbar,#v.playing.idle .vnav,#v.playing.idle #vclose{opacity:0;pointer-events:none}
-#v.playing.idle,#v.playing.idle #vi,#v.playing.idle #vv{cursor:none}
+/* поверх видео панель только в полном экране; в окне она, как у листа, отдельной строкой под картинкой */
+#v.playing.fs #vpanelbar{position:absolute;left:0;right:0;bottom:0;padding-top:28px;border:0;background:linear-gradient(transparent,#000e 55%);color:#fff}
+#v.playing.fs.idle #vpanelbar,#v.playing.fs.idle .vnav,#v.playing.fs.idle #vclose{opacity:0;pointer-events:none}
+#v.nocur,#v.nocur #vi,#v.nocur #vv{cursor:none}
 body.nobar #vpanelbar{display:none}
 #vseek{position:relative;height:18px;margin-bottom:4px;cursor:pointer;touch-action:none}
 #vtrack,#vfill{position:absolute;left:0;top:7px;height:4px;border-radius:2px;pointer-events:none}
@@ -3482,19 +3799,21 @@ body.nobar #vpanelbar{display:none}
 #vrow{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;font-size:13px}
 #vname{flex:1;min-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
 #vmeta{display:flex;gap:12px;color:var(--dim)}
-#vpl{position:relative;display:flex;align-items:center;flex:1 0 100%;gap:8px;min-height:34px}
-#vpl .sp{flex:1;min-width:100px}
+#vpl{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;flex:1 0 100%;gap:6px 12px;min-height:34px}
+#vplc,#vplr{display:flex;align-items:center;gap:8px}
+#vplc{grid-column:2;justify-self:center}
+#vplr{grid-column:3;justify-self:end}
 #vpl button{min-width:32px;padding:4px 7px}
 #vplay,#vmute{width:34px;height:32px;display:inline-flex;align-items:center;justify-content:center}
 #vmute svg{width:20px;height:20px}
 #vmute .i-off,#vmute.off .i-on{display:none}
 #vmute.off .i-off{display:block}
-#vtime{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);white-space:nowrap;font-variant-numeric:tabular-nums;pointer-events:none}
+#vtime{min-width:90px;white-space:nowrap;font-variant-numeric:tabular-nums;pointer-events:none}
 #vrate{min-width:48px!important;font-variant-numeric:tabular-nums}
 #vvol{width:90px}
 #voptions{display:flex;gap:4px}
 #voptions button.on{color:var(--acc2);border-color:var(--acc)}
-#vb{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;flex:1 0 100%}
+#vb{grid-column:1;justify-self:start;display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px}
 #vb button{font-size:13px;padding:5px 9px}
 #vtrim{display:flex;align-items:center;gap:8px;color:var(--acc2);font-size:13px;flex:1 0 100%}
 #vtrim button{padding:2px 10px;font-size:12px}
@@ -3502,7 +3821,7 @@ body.nobar #vpanelbar{display:none}
 #verr{position:absolute;left:0;right:0;top:0;z-index:4;padding:10px 16px;background:#8a2f2b;color:#fff;font-weight:600}
 #v.wait #vi{opacity:.5}
 body.wait,body.wait *{cursor:progress}
-@media(max-width:800px){#vpl{flex-wrap:wrap}#vpl .sp{min-width:0}#vtime{position:static;transform:none;margin-right:auto}#vvol{width:70px}#voptions{margin-left:auto}}
+@media(max-width:800px){#vpl{grid-template-columns:auto 1fr}#vb{grid-column:1/-1}#vplc{grid-column:1;justify-self:start}#vplr{grid-column:2}#vtime{min-width:0}#vvol{width:70px}}
 #cut{position:relative;padding:12px 16px 8px;background:#14161c;border-top:1px solid var(--line)}
 #ctrack{position:relative;height:46px;border-radius:6px;background:#1f4a3a;cursor:crosshair;touch-action:none;user-select:none}
 .creg{position:absolute;top:0;bottom:0;background:#b8403acc;border-left:2px solid #ff7d74;border-right:2px solid #ff7d74;cursor:pointer}
@@ -3517,15 +3836,29 @@ body.wait,body.wait *{cursor:progress}
 #crow .sp{flex:1}
 #cinfo{margin-top:2px}
 #chelp{margin:6px 0 0;font-size:12px}
+#mhead{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:6px;font-size:13px}
+#mhead .sp{flex:1}
+#mstrip{display:flex;gap:3px;height:34px;margin-bottom:8px;touch-action:none;user-select:none}
+.mclip{position:relative;flex:1 1 0;min-width:40px;overflow:hidden;padding:2px 6px;border:1px solid var(--line2);border-radius:5px;
+  background:#1f4a3a;font-size:11px;line-height:14px;white-space:nowrap;cursor:grab}
+.mclip.on{border-color:#fff;box-shadow:0 0 0 1px #fff}
+.mclip.drag{opacity:.7;cursor:grabbing}
+.mclip b{position:relative;z-index:1;display:block;overflow:hidden;text-overflow:ellipsis;font-weight:600}
+.mclip span{position:relative;z-index:1;color:#cfe3da}
+.mclip i{position:absolute;top:0;bottom:0;background:#b8403acc}
+#v.merging #cgo{display:none}
 #cpop{position:absolute;bottom:calc(100% - 6px);z-index:3;padding:4px;border:1px solid var(--line2);border-radius:8px;background:#0c0d11;box-shadow:0 8px 24px #000a;pointer-events:none}
 #ctile{position:relative;width:320px;background:#000 no-repeat}
 #cimg{position:absolute;left:4px;top:4px;width:320px;visibility:hidden}
 #cimg.on{visibility:visible}
 #ctime{display:block;padding-top:3px;text-align:center;font-size:12px;font-variant-numeric:tabular-nums}
-#v.cutting #vprev,#v.cutting #vnext,#v.cutting #vdel,#v.cutting #vcut{pointer-events:none;opacity:.4}
-#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:60;max-width:90vw;padding:9px 16px;border-radius:10px;background:#1d2029;border:1px solid var(--line2);box-shadow:0 10px 30px #000a;opacity:0;pointer-events:none}
+#v.cutting #vprev,#v.cutting #vnext{pointer-events:none;opacity:.4}
+#v.cutting #vpl,#v.cutting #vseek{display:none!important}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:60;max-width:90vw;padding:9px 16px;border-radius:10px;background:#1d2029;border:1px solid var(--line2);box-shadow:0 10px 30px #000a;opacity:0;pointer-events:none;display:flex;align-items:center;gap:10px}
 body.viewing #toast{bottom:76px}
-#toast.on{opacity:1}
+#toast.on{opacity:1;pointer-events:auto}
+#toastx{flex:none;padding:0 6px;border:0;background:none;color:var(--dim);font-size:13px;line-height:20px}
+#toastx:hover{color:#fff}
 #toast.bad{border-color:var(--bad)}
 @media (prefers-reduced-motion:no-preference){#toast{transition:opacity .2s}}
 @media (max-width:760px){
@@ -3665,6 +3998,7 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
     <button id="sdel" class="danger" title="Move the selected videos with their previews to _to_delete (Del). Ctrl+Z brings them all back"></button>
     <button id="sredo" title="Replace the previews of the selected videos with new ones"></button>
     <button id="splay" title="Play the selected videos in the video player"></button>
+    <button id="smerge" title="Join the selected videos into one file: reorder and trim them first. No re-encoding"></button>
     <button id="sall" title="Select all previews in this list (Ctrl+A)">Select all</button>
     <button id="snone" title="Clear selection (Esc)">Clear selection</button>
   </div>
@@ -3745,6 +4079,11 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
   <div id="vtov" hidden></div>
   <div id="cut" hidden>
     <div id="cpop" hidden><div id="ctile"></div><img id="cimg" alt=""><span id="ctime"></span></div>
+    <div id="mhead" hidden><span id="mtot"></span><span class="sp"></span>
+      <button id="mleft" title="Move the selected video earlier (Alt+←)">◀ Move</button>
+      <button id="mright" title="Move the selected video later (Alt+→)">Move ▶</button>
+      <button id="mrem" title="Leave the selected video out of the merge">Remove from merge</button></div>
+    <div id="mstrip" hidden title="Videos in merge order: click to select and trim one, drag to reorder"></div>
     <div id="ctrack"><div id="cregs"></div><div id="cmark" hidden></div><div id="ccur"></div></div>
     <div id="cticks"></div>
     <div id="cinfo"></div>
@@ -3752,6 +4091,7 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
       <button id="cclr" title="Remove all marks">Reset</button>
       <button id="conly" title="Trim now, keeping only the selected piece: everything before and after it is removed (K)">Keep only this… (K)</button>
       <button id="cgo" class="go" title="Remove the red parts from the video file">Trim…</button>
+      <button id="mgo" class="go" hidden title="Join the videos in this order, without the red parts, into one file">Merge…</button>
       <button id="cexit" title="Close trimming (Esc)">Close</button>
       <span class="sp"></span>
       <button id="chead" title="Mark everything from the start of the video to the cursor for removal">Cut before cursor</button>
@@ -3769,19 +4109,23 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
     <div id="vseek" hidden><div id="vtrack"></div><div id="vfill"></div><div id="vknob"></div></div>
     <div id="vrow">
       <span id="vname"></span><span id="vpos" class="dim"></span><span id="vmeta"></span>
-      <div id="vpl" hidden>
-        <button id="vplay" title="Play / pause (Space)" aria-label="Play">▶</button>
-        <button id="vrate" title="Playback speed (Shift+, and Shift+.)">1×</button>
-        <span class="sp"></span><span id="vtime">0:00 / 0:00</span>
-        <button id="vmute" tabindex="-1" title="Mute (M)"><svg class="i-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z" fill="currentColor"/><path d="M15.5 9a4 4 0 010 6M18 6.5a8 8 0 010 11"/></svg><svg class="i-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z" fill="currentColor"/><path d="M16 9.5l5 5M21 9.5l-5 5"/></svg></button>
-        <input id="vvol" type="range" min="0" max="1" step="0.01" aria-label="Volume (↑ ↓)">
-        <span id="voptions"><button id="vauto" title="Autoplay" aria-label="Autoplay">A▶</button><button id="vnextEnd" title="Next video on end" aria-label="Next video on end">▶|</button><button id="vloop" title="Loop" aria-label="Loop">↻</button></span>
-      </div>
+      <div id="vpl">
       <div id="vb">
         <button id="vpk" title="Select for bulk actions">Select</button>
         <button id="vopen" title="Open in the external video player">Open video</button>
         <button id="vcut" title="Cut unwanted parts: the start, the end or pieces in the middle">Trim</button>
         <button id="vdel" class="del" title="Delete the video with its preview (Del)">Delete video</button>
+      </div>
+      <div id="vplc" hidden>
+        <button id="vplay" title="Play / pause (Space)" aria-label="Play">▶</button>
+        <button id="vrate" title="Playback speed (Shift+, and Shift+.)">1×</button>
+        <span id="vtime">0:00 / 0:00</span>
+      </div>
+      <div id="vplr" hidden>
+        <button id="vmute" tabindex="-1" title="Mute (M)"><svg class="i-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z" fill="currentColor"/><path d="M15.5 9a4 4 0 010 6M18 6.5a8 8 0 010 11"/></svg><svg class="i-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z" fill="currentColor"/><path d="M16 9.5l5 5M21 9.5l-5 5"/></svg></button>
+        <input id="vvol" type="range" min="0" max="1" step="0.01" aria-label="Volume (↑ ↓)">
+        <span id="voptions"><button id="vauto" title="Autoplay" aria-label="Autoplay">A▶</button><button id="vnextEnd" title="Next video on end" aria-label="Next video on end">▶|</button><button id="vloop" title="Loop" aria-label="Loop">↻</button></span>
+      </div>
       </div>
       <span id="vtrim" hidden><span id="vtrimt"></span><button id="vtstop" title="Stop trimming: the video stays unchanged">Stop</button></span>
     </div>
@@ -3845,8 +4189,8 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
       <span><kbd>Space</kbd></span><span>play / pause (on the sheet: start the video)</span>
       <span><kbd>Enter</kbd></span><span>full screen on / off</span>
       <span>Click, double click</span><span>click: play / pause; double click: full screen on / off</span>
-      <span><kbd>←</kbd> <kbd>→</kbd></span><span>previous / next (past the last one: the next folder); mouse wheel too</span>
-      <span><kbd>Shift+←</kbd> <kbd>→</kbd></span><span>seek 5 s (Ctrl — 30 s, Ctrl+Shift — 2 min)</span>
+      <span><kbd>←</kbd> <kbd>→</kbd></span><span>while playing: seek 5 s; paused or on the sheet: previous / next (past the last one: the next folder); mouse wheel too</span>
+      <span><kbd>Shift</kbd> <kbd>Ctrl</kbd> + <kbd>←</kbd> <kbd>→</kbd></span><span>seek 30 s / 2 min</span>
       <span><kbd>↑</kbd> <kbd>↓</kbd> <kbd>M</kbd></span><span>volume, mute</span>
       <span><kbd>,</kbd> <kbd>.</kbd></span><span>on pause: frame back / forward</span>
       <span><kbd>Shift+,</kbd> <kbd>Shift+.</kbd></span><span>slower / faster (0.5× to 2×)</span>
@@ -3864,11 +4208,16 @@ code{padding:1px 6px;border-radius:5px;background:#00000050;font-family:Consolas
       <span><kbd>Del</kbd></span><span>unmark the selected piece (it stays)</span>
       <span><kbd>Esc</kbd></span><span>clear the mark / selection, close</span>
       <span>Several videos</span><span>trims wait in a queue and run one after another in the background</span>
+      <h3>Merging (select videos → Merge…)</h3>
+      <span>Click, drag</span><span>choose a video to trim / change the order in the strip</span>
+      <span><kbd>Alt</kbd>+<kbd>←</kbd> <kbd>→</kbd></span><span>move the selected video earlier / later</span>
+      <span><kbd>PgUp</kbd> <kbd>PgDn</kbd></span><span>previous / next video of the merge</span>
+      <span><kbd>K</kbd></span><span>mark everything outside the selected piece (trimming keys work as above)</span>
     </div>
     <div class="acts"><button id="keyclose" class="go">Close</button></div>
   </div>
 </div>
-<div id="toast"></div>
+<div id="toast"><span id="toastt"></span><button id="toastx" title="Close" aria-label="Close">✕</button></div>
 <script>
 const T = new URLSearchParams(location.search).get('t');
 const q = p => p + (p.includes('?') ? '&' : '?') + 't=' + encodeURIComponent(T);
@@ -3906,7 +4255,8 @@ let player = {ok: true, name: 'default app', add: false, os: 'win'};
 let picked = new Set(), anchor = -1;   // выделенные плитки (номера пар) и опорная плитка для Shift+клик
 let opts = {cols: 10, rows: 9, width: 2560, header: false, hw: ''};
 let refreshing = false;
-let C = null;                        // открытая обрезка видео (см. «обрезка видео»)
+let M = null;                        // открытое объединение видео: {clips: [{id, info, cuts, snaps}], sel}
+let C = null;                      // открытая обрезка видео (см. «обрезка видео»)
 const purl = it => q('/p/' + it.id + '?v=' + Math.round(it.pm || 0));
 // сортировка галереи: ключ (name/date/size) и направление; прежние значения srt (new/old/big) переводятся
 const SRT_OLD = {new: ['date', true], old: ['date', false], big: ['size', true]};
@@ -3972,11 +4322,14 @@ const spans = it => parts(it).map(s => '<span>' + s + '</span>').join('');
 
 function toast(msg, bad) {
   const t = $('#toast');
-  t.textContent = msg;
+  $('#toastt').textContent = msg;
   t.className = 'on' + (bad ? ' bad' : '');
   clearTimeout(toast.h);
   toast.h = setTimeout(() => { t.className = ''; }, bad ? 9000 : 2600);
 }
+$('#toast').onmouseenter = () => clearTimeout(toast.h);  // навели — не исчезает, пока не закроют или не уведут мышь
+$('#toast').onmouseleave = () => { if ($('#toast').classList.contains('on')) toast.h = setTimeout(() => { $('#toast').className = ''; }, 1500); };
+$('#toastx').onclick = () => { clearTimeout(toast.h); $('#toast').className = ''; };
 
 async function api(path, post, body) {
   const opt = post ? {method: 'POST'} : {};
@@ -4092,7 +4445,6 @@ function revealTree(rel = folder) {
 }
 
 function renderCrumbs() {
-  const l = (typeof OSL !== 'undefined' && (OSL[player.os] || OSL.win)) || ['Open in Explorer', 'Open the selected folder in Explorer'];
   const segs = folder ? folder.split('/') : [];
   let h = folder ? '<button class="cr" data-d="">' + esc(ROOT || '—') + '</button>' : '<span class="cur">' + esc(ROOT || '—') + '</span>';
   for (let i = 0; i < segs.length; i++) {
@@ -4101,8 +4453,7 @@ function renderCrumbs() {
       ? '<span class="cur">' + esc(segs[i]) + '</span>'
       : '<button class="cr" data-d="' + esc(d) + '">' + esc(segs[i]) + '</button>');
   }
-  h += '<button class="xpl" title="' + esc(l[1]) + '">' + esc(l[0]) + '</button>';
-  $('#crumbs').innerHTML = h;
+  $('#crumbs').innerHTML = h;  // проводник — в меню папки в дереве (правый клик)
 }
 
 function renderTree() {
@@ -4271,10 +4622,7 @@ function tile(it) {
     '<div class="im"><span class="pk" title="Select: click here, X or Ctrl+click the preview; Shift+click selects a range"></span><img loading="lazy" alt="" src="' + purl(it) + '">' +
     (it.nv ? '' : '<b class="nov">no video</b>') + wbHtml(it) + '</div>' +
     '<figcaption>' + (it.err ? '<div class="err">' + esc(it.err) + '</div>' : '') +
-    '<div class="nm" title="' + esc(full(it)) + '">' + esc(label(it)) + '</div>' +
-    '<div class="row">' + spans(it) +
-    '<span class="bt"><button data-a="open"' + (it.nv ? '' : ' disabled') + ' title="Play the video right here">Play</button>' +
-    '<button data-a="del" class="del" title="' + (it.nv ? 'Delete the video with its preview' : 'Delete the preview') + ' (Del)">Delete</button></span></div></figcaption>';
+    '<div class="cap"><div class="nm" title="' + esc(full(it)) + '">' + esc(label(it)) + '</div>' + spans(it) + '</div></figcaption>';
   return f;
 }
 
@@ -4384,18 +4732,25 @@ function hud(text, sticky = false) {
   $('#vmsg').hidden = false;
   if (!sticky) P.hudT = setTimeout(() => { $('#vmsg').hidden = true; }, 1200);
 }
+// панель просмотра. В полном экране при воспроизведении она прячется через 1 с после старта и не появляется до паузы
+// или выхода из полного экрана: движение мыши её не показывает (окно присылает mousemove и само — панель мигала)
+const fsPlaying = () => viewer && fsOn && P.vid && !vv.paused && !C;
 function barShow() {
   if (!viewer) return;
-  $('#v').classList.remove('idle');
+  const v = $('#v');
+  v.classList.toggle('fs', fsOn);
   clearTimeout(P.idleT);
-  if (!fsOn || !$('#v').classList.contains('playing') || C) return;
-  const arm = () => {
-    P.idleT = setTimeout(() => {
-      if (!viewer || !fsOn || !$('#v').classList.contains('playing') || C) return;
-      if ($('#vpanelbar').matches(':hover')) arm(); else { $('#v').classList.add('idle'); pvHide(); }
-    }, 2000);
-  };
-  arm();
+  if (!fsPlaying()) { v.classList.remove('idle', 'nocur'); return; }
+  if (v.classList.contains('idle')) return;  // уже спрятана — так и остаётся
+  P.idleT = setTimeout(() => { if (fsPlaying()) { v.classList.add('idle', 'nocur'); pvHide(); } }, 1000);
+}
+// движение мыши в полном экране при воспроизведении — только курсор, на секунду
+function curShow() {
+  const v = $('#v');
+  if (!v.classList.contains('idle')) return;
+  v.classList.remove('nocur');
+  clearTimeout(P.curT);
+  P.curT = setTimeout(() => { if (v.classList.contains('idle')) v.classList.add('nocur'); }, 1000);
 }
 function showViewer() {
   if (C && (!viewer || !items[cur] || items[cur].id !== C.id)) closeCut(true);
@@ -4425,7 +4780,7 @@ function showViewer() {
   $('#vdel').textContent = it.nv ? 'Delete video' : 'Delete preview';
   // новое превью: видео стартует само только по Play/«Play here», «следующему по окончании» или с Autoplay; иначе — лист
   if (changed) {
-    const start = P.start || pAuto;
+    const start = (P.start || pAuto) && !C;  // при обрезке и склейке — только лист: плеер закрыл бы их
     P.start = false;
     if (start && it.nv && !trimBusy(it.id)) playerOn();
     else { pRelease(); P.on = false; P.bad = false; $('#vfail').hidden = true; pView(false); }
@@ -4475,7 +4830,7 @@ const vv = $('#vv'), RATES = [0.5, 0.75, 1, 1.25, 1.5, 2];
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 const P = {on: false, id: null, ver: null, file: null, bad: false, seekT: null, loadT: 0, raf: 0, drag: false,
   info: null, L: null, infos: new Map(), prefetched: new Set(), start: false, shown: null, shownVer: null,
-  idleT: 0, hudT: 0, clickT: 0, tovT: 0, wheelAt: 0, watchT: 0, watched: 0, watchAt: 0, saveAt: 0,
+  idleT: 0, curT: 0, hudT: 0, clickT: 0, tovT: 0, wheelAt: 0, watchT: 0, watched: 0, watchAt: 0, saveAt: 0,
   playing: false, resumed: false, vid: false, pauseT: 0};
 let pVol = clamp(parseFloat(store.get('vol') ?? '1') || 0, 0, 1), pMuted = store.get('mute') === '1';
 let pRate = RATES.includes(+store.get('rate')) ? +store.get('rate') : 1;
@@ -4501,9 +4856,10 @@ function pView(video) {
   $('#v').classList.toggle('playing', P.vid);
   $('#vi').hidden = P.vid;
   vv.hidden = !P.vid;
-  $('#vpl').hidden = $('#vseek').hidden = !(P.on && P.id !== null && !P.bad);
+  $('#vplc').hidden = $('#vplr').hidden = $('#vseek').hidden = !(P.on && P.id !== null && !P.bad);
   $('#vb').hidden = P.vid;
-  if (!P.vid) $('#v').classList.remove('idle');
+  $('#vpl').hidden = $('#vb').hidden && $('#vplc').hidden;
+  if (!P.vid) $('#v').classList.remove('idle', 'nocur');
   pControls();
 }
 // пауза дольше 2 с — снова лист превью (видео остаётся на паузе на том же месте)
@@ -4832,7 +5188,7 @@ vv.addEventListener('play', () => {
 });
 vv.addEventListener('playing', () => { P.playing = true; P.watchAt = performance.now(); });
 vv.addEventListener('waiting', () => { pWatch(); P.playing = false; });
-vv.addEventListener('pause', () => { pWatch(); P.playing = false; pUi(); if (P.on && !vv.ended) pPauseLater(); });
+vv.addEventListener('pause', () => { pWatch(); P.playing = false; pUi(); barShow(); if (P.on && !vv.ended) pPauseLater(); });
 vv.addEventListener('timeupdate', () => { if (!P.drag) pUi(); });
 vv.addEventListener('loadedmetadata', pMetadata);
 vv.addEventListener('loadeddata', () => clearTimeout(P.loadT));
@@ -4869,7 +5225,7 @@ seek.onpointermove = e => { if (pDur()) { const t = seekT(e); if (P.drag) pSeekT
 seek.onpointerup = () => { P.drag = false; pvHide(); };
 seek.onpointercancel = () => { P.drag = false; pvHide(); };
 seek.onpointerleave = () => { if (!P.drag) pvHide(); };
-$('#v').addEventListener('mousemove', barShow);
+$('#v').addEventListener('mousemove', curShow);
 $('#vstage').addEventListener('wheel', e => {
   if (C) return;
   e.preventDefault();
@@ -4900,7 +5256,9 @@ addEventListener('pagehide', () => { pWatch(); pProgress(true); pvStop(); });
 let cutTimer = 0, frameTimer = 0, frameBusy = false, frameWant = null, cutSt = {running: false};
 const track = $('#ctrack');
 // это видео сейчас режется или ждёт в очереди обрезки (его нельзя играть, удалять и снова ставить в очередь)
-const trimBusy = id => (cutSt.running && cutSt.id === id) || (cutSt.queue || []).some(t => t.id === id);
+// видео, которое режут или склеивают или которое ждёт в очереди: не играет, не удаляется, второй раз не ставится
+const qIds = t => t.ids || [t.id];
+const trimBusy = id => (cutSt.running && cutSt.id != null && qIds(cutSt).includes(id)) || (cutSt.queue || []).some(t => qIds(t).includes(id));
 
 const fmtT = (t, fine) => {
   const s = Math.max(0, t), h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
@@ -4946,12 +5304,153 @@ async function openCut() {
 
 async function closeCut(force) {
   if (!C) return;
-  if (!force && C.cuts.length && !await ask('Close trimming? The marked pieces will be lost.', 'Close')) return;
+  if (!force && (M ? !await ask('Close merging? The order and the marks will be lost.', 'Close')
+    : C.cuts.length && !await ask('Close trimming? The marked pieces will be lost.', 'Close'))) return;
   C = null;
   hidePop();
   $('#cut').hidden = true;
   $('#v').classList.remove('cutting');
+  if (M) { M = null; mergeUi(); }
 }
+
+/* ───── объединение видео: та же панель обрезки, сверху — полоса роликов в порядке склейки ───── */
+
+const newC = c => ({id: c.id, d: c.info.duration, info: c.info, cuts: c.cuts, sel: -1, cur: 0, mark: null, snaps: c.snaps,
+  L: null, drag: null, popT: null});
+function mergeUi() {
+  const on = !!M;
+  $('#v').classList.toggle('merging', on);
+  $('#mhead').hidden = $('#mstrip').hidden = $('#mgo').hidden = !on;
+  $('#conly').textContent = on ? 'Keep only this (K)' : 'Keep only this… (K)';
+  $('#conly').title = on ? 'Mark everything before and after the selected piece of this video for removal (K)'
+    : 'Trim now, keeping only the selected piece: everything before and after it is removed (K)';
+}
+function mergeSave() {  // отметки выбранного ролика — обратно в его запись (normCuts заменяет массив)
+  const c = M && C && M.clips.find(x => x.id === C.id);
+  if (c) { c.cuts = C.cuts; c.snaps = C.snaps; }
+}
+function mergeSelect(i) {
+  mergeSave();
+  const c = M.clips[i], k = items.findIndex(x => x.id === c.id);
+  if (k < 0) { closeCut(true); toast('Merging closed: a video of it is no longer in this list', true); return; }
+  M.sel = i;
+  hidePop();
+  C = newC(c);
+  select(k, false);
+  cutLayout();
+  renderTicks();
+  renderCut();
+}
+// сколько останется от ролика: как removedOf(), но по его собственным отметкам и ключевым кадрам
+const mergeKept = c => {
+  const d = c.info.duration;
+  return d - c.cuts.reduce((s, x) => s + Math.max(0, Math.max(x.a, x.b >= d - 0.05 ? d : (c.snaps[x.b.toFixed(2)] ?? x.b)) - x.a), 0);
+};
+function mergeName() {
+  const f = M.clips[0].info.file, dot = f.lastIndexOf('.');
+  return dot > 0 ? f.slice(0, dot) + '_merged' + f.slice(dot) : f + '_merged';
+}
+function renderStrip() {
+  if (!M) return;
+  mergeSave();
+  $('#mstrip').innerHTML = M.clips.map((c, i) => {
+    const d = c.info.duration;
+    const marks = c.cuts.map(x => '<i style="left:' + (100 * x.a / d) + '%;width:' + (100 * (x.b - x.a) / d) + '%"></i>').join('');
+    return '<div class="mclip' + (i === M.sel ? ' on' : '') + '" data-i="' + i + '" style="flex-grow:' + d + '" title="' +
+      esc('#' + (i + 1) + ' ' + c.info.file) + '">' + marks + '<b>' + (i + 1) + '. ' + esc(c.info.file) + '</b><span>' +
+      fmtT(mergeKept(c)) + (c.cuts.length ? ' of ' + fmtT(d) : '') + '</span></div>';
+  }).join('');
+  const tot = M.clips.reduce((s, c) => s + mergeKept(c), 0);
+  $('#mtot').innerHTML = M.clips.length + ' videos → <b>' + fmtT(tot) + '</b> · ' + esc(mergeName());
+  $('#mleft').disabled = M.sel <= 0;
+  $('#mright').disabled = M.sel >= M.clips.length - 1;
+  $('#mrem').disabled = M.clips.length <= 2;
+}
+function mergeMove(i, j) {  // ролик i встаёт на место j; выбранный остаётся выбранным
+  if (j < 0 || j >= M.clips.length || i === j) return;
+  const selc = M.clips[M.sel];
+  M.clips.splice(j, 0, M.clips.splice(i, 1)[0]);
+  M.sel = M.clips.indexOf(selc);
+  renderStrip();
+}
+async function openMerge() {
+  const sel = items.filter(i => picked.has(i.id) && i.nv === 1);
+  if (sel.length < 2) { toast('Select at least two videos to merge'); return; }
+  if (!ff.ok) { toast('ffmpeg not found: cannot merge', true); return; }
+  if (sel.some(i => trimBusy(i.id))) { toast('Some of these videos are being trimmed or merged or wait in the queue', true); return; }
+  let r;
+  try {
+    r = await api('/api/merge/info', true, {ids: sel.map(i => i.id)});
+  } catch (e) {
+    toast('Cannot merge: ' + e.message, true);
+    return;
+  }
+  if (C) await closeCut(true);
+  const k = items.findIndex(x => x.id === r.clips[0].id);
+  if (k < 0) return;
+  cur = k;
+  openViewer();
+  M = {clips: r.clips.map(c => ({id: c.id, info: c, cuts: [], snaps: {}})), sel: 0};
+  mergeUi();
+  $('#v').classList.add('cutting');
+  $('#cut').hidden = false;
+  mergeSelect(0);
+}
+async function startMerge() {
+  mergeSave();
+  const n = M.clips.length, tot = M.clips.reduce((s, c) => s + mergeKept(c), 0);
+  const busy = cutSt.running ? 'Another trimming or merging is running: this one waits in the queue.\n'
+    : job.running ? 'Previews are being created: merging starts after that.\n' : '';
+  if (!await ask('Merge ' + n + ' videos into "' + mergeName() + '" (about ' + fmtT(tot) + ')?\n\n' +
+      M.clips.map((c, i) => (i + 1) + '. ' + c.info.file + (c.cuts.length ? ' (trimmed)' : '')).join('\n') + '\n\n' + busy +
+      'No re-encoding: trimmed parts start at the nearest keyframe, so up to a couple of extra seconds may stay.\n' +
+      'Merging runs in the background, progress is shown at the top. The originals and their previews go to _to_delete, ' +
+      'Ctrl+Z brings them back. A preview for the new video will be created.', 'Merge')) return;
+  if (!M) return;
+  try {
+    cutSt = await api('/api/merge/start', true, {clips: M.clips.map(c => ({id: c.id, cuts: c.cuts.map(x => [x.a, x.b])}))});
+  } catch (e) {
+    toast('Not merged: ' + e.message, true);
+    return;
+  }
+  picked.clear();
+  pickStat();
+  closeCut(true);
+  renderCutBar();
+  cutWatch();
+}
+let mDrag = null;
+$('#mstrip').onpointerdown = e => {
+  const b = e.target.closest('.mclip');
+  if (!b || e.button !== 0) return;
+  try { $('#mstrip').setPointerCapture(e.pointerId); } catch (_) { /* без захвата перетаскивание за край оборвётся */ }
+  mDrag = {i: +b.dataset.i, x0: e.clientX, moved: false};
+};
+$('#mstrip').onpointermove = e => {
+  if (!mDrag) return;
+  if (!mDrag.moved && Math.abs(e.clientX - mDrag.x0) < 6) return;
+  mDrag.moved = true;
+  const bs = [...$('#mstrip').children], j = bs.findIndex(b => { const r = b.getBoundingClientRect(); return e.clientX >= r.left && e.clientX < r.right; });
+  if (j >= 0 && j !== mDrag.i) { mergeMove(mDrag.i, j); mDrag.i = j; }
+  const b = $('#mstrip').children[mDrag.i];
+  if (b) b.classList.add('drag');
+};
+$('#mstrip').onpointerup = () => {
+  const g = mDrag;
+  mDrag = null;
+  if (!g || !M) return;
+  if (!g.moved && g.i !== M.sel) mergeSelect(g.i);
+  else renderStrip();
+};
+$('#mleft').onclick = () => mergeMove(M.sel, M.sel - 1);
+$('#mright').onclick = () => mergeMove(M.sel, M.sel + 1);
+$('#mrem').onclick = () => {
+  if (M.clips.length <= 2) return;
+  M.clips.splice(M.sel, 1);
+  C = null;  // выбранного больше нет в склейке: его отметки не сохраняем
+  mergeSelect(Math.min(M.sel, M.clips.length - 1));
+};
+$('#mgo').onclick = startMerge;
 
 // где в листе превью лежит каждый кадр: сетка — от сервера (как её строит make_preview), размер листа — по картинке.
 // Не сошлось (лист сделан не этой программой или с другими параметрами) — всплывают только точные кадры.
@@ -5010,10 +5509,10 @@ function needSnaps() {
     const k = c.b.toFixed(2);
     if (c.b >= C.d - 0.05 || k in C.snaps) continue;
     C.snaps[k] = null;  // запрошено
-    const id = C.id;
+    const id = C.id, sn = C.snaps;  // ответ — в отметки своего ролика, даже если при склейке уже выбран другой
     api('/api/cut/key', true, {id, at: +k})
-      .then(r => { if (C && C.id === id) { C.snaps[k] = r.t; renderCut(); } })
-      .catch(() => { if (C && C.id === id) delete C.snaps[k]; });
+      .then(r => { sn[k] = r.t; if (C && C.snaps === sn) renderCut(); else if (M) renderStrip(); })
+      .catch(() => { delete sn[k]; });
   }
 }
 
@@ -5034,9 +5533,11 @@ function renderCut() {
     ? 'red is removed: ' + n + ' ' + plural(n, ['piece', 'pieces']) + ', <b>' + fmtT(kept) + '</b> of ' + fmtT(C.d) + ' stays'
     : 'nothing marked, the video stays whole (' + fmtT(C.d) + ')');
   if (C.mark !== null) t += ' · piece from ' + fmtT(C.mark, true) + ', set its end (O)';
+  if (M) t = 'Video ' + (M.sel + 1) + ' of ' + M.clips.length + ' · ' + t;
   $('#cinfo').innerHTML = t;
   $('#cdel').disabled = $('#conly').disabled = C.sel < 0;
   $('#cgo').disabled = $('#cclr').disabled = !n;
+  if (M) renderStrip();
   if (!C.drag) needSnaps();
 }
 
@@ -5073,6 +5574,7 @@ function keepOnlyStart() {
   if (k.a >= 0.2) cuts.push({a: 0, b: k.a});
   if (C.d - k.b >= 0.2) cuts.push({a: k.b, b: C.d});
   if (!cuts.length) { toast('The piece covers the whole video: nothing to remove'); return; }
+  if (M) { C.cuts = cuts; C.sel = -1; renderCut(); return; }  // при склейке — только отметки, режет общая кнопка Merge
   const it = items.find(x => x.id === C.id), name = it ? full(it) : C.info.file;
   submitCut(cuts, 'Keep only ' + fmtT(k.a, true) + ' – ' + fmtT(k.b, true) + ' of "' + name + '"?\n' +
     'Everything before and after it is removed: about ' + fmtT(k.b - k.a) + ' of ' + fmtT(C.d) + ' stays' +
@@ -5169,6 +5671,17 @@ track.onpointerleave = () => { if (C && !C.drag) hidePop(); };
 
 function cutKey(e) {
   const step = e.ctrlKey || e.metaKey ? 60 : e.shiftKey ? 10 : 1;
+  if (M && e.altKey && (e.code === 'ArrowLeft' || e.code === 'ArrowRight')) {  // порядок склейки
+    mergeMove(M.sel, M.sel + (e.code === 'ArrowLeft' ? -1 : 1));
+    e.preventDefault();
+    return;
+  }
+  if (M && (e.code === 'PageUp' || e.code === 'PageDown')) {  // соседний ролик склейки
+    const j = M.sel + (e.code === 'PageUp' ? -1 : 1);
+    if (j >= 0 && j < M.clips.length) mergeSelect(j);
+    e.preventDefault();
+    return;
+  }
   switch (e.code) {
     case 'ArrowRight': moveCur(C.cur + step); break;
     case 'ArrowLeft': moveCur(C.cur - step); break;
@@ -5191,6 +5704,7 @@ function cutKey(e) {
 }
 
 async function startCut() {
+  if (M) { startMerge(); return; }
   if (!C || !C.cuts.length) return;
   const it = items.find(x => x.id === C.id), n = C.cuts.length;
   const kept = C.d - C.cuts.reduce((s, c) => s + removedOf(c), 0);
@@ -5219,24 +5733,25 @@ async function submitCut(cuts, text) {
 let cutSeen = -1;           // номер последнего показанного итога обрезки (cutSt.seq)
 function renderCutBar() {
   const s = cutSt, q = s.queue || [];
-  const it = viewer ? items[cur] : null, qi = it ? q.findIndex(t => t.id === it.id) : -1;
+  const it = viewer ? items[cur] : null, qi = it ? q.findIndex(t => qIds(t).includes(it.id)) : -1;
   $('#cutbar').hidden = !s.running;
   $('#vtrim').hidden = !s.running;
   if (!s.running) return;
-  const st = s.id == null ? 'finishing…' : (s.stage || 'preparing') + (s.stage === 'cutting' ? ' ' + (s.pct || 0) + '%' : '') +
-    (s.stopped ? ' (stopping…)' : '…');
+  const verb = s.kind === 'merge' ? 'Merging' : 'Trimming', mine = it && s.id != null && qIds(s).includes(it.id);
+  const st = s.id == null ? 'finishing…' : (s.stage || 'preparing') +
+    (s.stage === 'cutting' || s.stage === 'merging' ? ' ' + (s.pct || 0) + '%' : '') + (s.stopped ? ' (stopping…)' : '…');
   const more = q.length ? ' · queued: ' + q.length : '';
-  $('#cbar').style.width = (s.stage === 'cutting' || s.stage === 'replacing the file' ? s.pct || 0 : 0) + '%';
-  $('#cptxt').textContent = (s.id != null ? 'Trimming ' + s.name + ': ' : 'Trimming: ') + st + more;
-  $('#cstop').title = 'Stop trimming' + (q.length ? ' and clear the queue' : '') + ': the videos stay unchanged';
+  $('#cbar').style.width = (/^(cutting|merging|replacing)/.test(s.stage || '') ? s.pct || 0 : 0) + '%';
+  $('#cptxt').textContent = (s.id != null ? verb + ' ' + s.name + ': ' : 'Trimming and merging: ') + st + more;
+  $('#cstop').title = 'Stop' + (q.length ? ' and clear the queue' : '') + ': the videos stay unchanged';
   if (qi >= 0) {
-    $('#vtrimt').textContent = 'Queued for trimming (#' + (qi + 1) + ')';
+    $('#vtrimt').textContent = 'Queued for ' + (q[qi].kind === 'merge' ? 'merging' : 'trimming') + ' (#' + (qi + 1) + ')';
     $('#vtstop').textContent = 'Cancel';
-    $('#vtstop').title = 'Remove this video from the trimming queue';
+    $('#vtstop').title = 'Remove from the queue' + (q[qi].kind === 'merge' ? ' (the whole merge)' : '');
   } else {
-    $('#vtrimt').textContent = (it && s.id === it.id ? 'Trimming: ' : 'Trimming ' + (s.name || '') + ': ') + st + more;
+    $('#vtrimt').textContent = (mine ? verb + ': ' : verb + ' ' + (s.name || '') + ': ') + st + more;
     $('#vtstop').textContent = 'Stop';
-    $('#vtstop').title = 'Stop trimming this video: it stays unchanged';
+    $('#vtstop').title = 'Stop ' + verb.toLowerCase() + ': the videos stay unchanged';
   }
   $('#vtrimt').title = s.name || '';
 }
@@ -5256,8 +5771,14 @@ async function cutTick() {
   for (const r of (s.last || [])) {
     if (r.seq <= cutSeen) continue;
     cutSeen = r.seq;
-    if (r.error) toast('Not trimmed: ' + r.name + ': ' + r.error, true);
-    else { toast('Trimmed: ' + r.name + '. ' + (r.note || 'Recreating the preview…'), !!r.note); reload = true; }
+    const m = r.kind === 'merge';
+    if (r.silent) continue;  // задачу сняли удалением видео
+    if (r.error) toast((m ? 'Not merged: ' : 'Not trimmed: ') + r.name + ': ' + r.error, true);
+    else {
+      toast((m ? 'Merged ' + r.name + '. Ctrl+Z brings the originals back. ' : 'Trimmed: ' + r.name + '. ') +
+        (r.note || 'Creating the preview…'), !!r.note);
+      reload = true;
+    }
   }
   if (reload) await load().catch(() => {});  // без перехода к обрезанному: пользователь мог уйти в другую папку
   if (cutSt.running) cutWatch();
@@ -5277,7 +5798,7 @@ const cutStop = body => api('/api/cut/stop', true, body).then(s => { cutSt = s; 
 $('#cstop').onclick = () => cutStop({});
 $('#vtstop').onclick = () => {
   const it = viewer ? items[cur] : null, q = cutSt.queue || [];
-  const id = it && q.some(t => t.id === it.id) ? it.id : cutSt.id;
+  const id = it && q.some(t => qIds(t).includes(it.id)) ? it.id : cutSt.id;
   if (id != null) cutStop({id});
 };
 $('#cexit').onclick = () => closeCut();
@@ -5430,11 +5951,7 @@ grid.onclick = e => {
   if (i < 0) return;
   select(i, false);
   if (e.target.closest('.pk')) { togglePick(i, e.shiftKey); return; }
-  const b = e.target.closest('button');
-  if (b) {
-    if (b.dataset.a === 'open') playItem(i);
-    else if (b.dataset.a === 'del') removeCur();
-  } else if (e.target.closest('.im')) {
+  if (e.target.closest('.im')) {
     if (e.shiftKey) togglePick(i, true);
     else if (e.ctrlKey || e.metaKey) togglePick(i, false);
     else openViewer();
@@ -5461,8 +5978,7 @@ addEventListener('pointerdown', e => {
 }, true);
 $('#crumbs').onclick = e => {
   const cr = e.target.closest('.cr');
-  if (cr) { setFolder(cr.dataset.d); return; }
-  if (e.target.closest('.xpl')) folderExplorer(folder);
+  if (cr) setFolder(cr.dataset.d);
 };
 $('#tsrt').value = tsort;
 $('#tsdir').textContent = tdesc ? '↓' : '↑';
@@ -5546,8 +6062,10 @@ addEventListener('keydown', e => {
     return;
   }
   if (!$('#trashp').hidden || !$('#rootp').hidden || !$('#menup').hidden) {
-    if (e.code === 'Escape') { $('#trashp').hidden = $('#rootp').hidden = $('#menup').hidden = true; e.preventDefault(); }
-    return;
+    // всплывающие окна шапки не держат программу: Esc закрывает, клавиши внутри окна — ему, любая другая закрывает и работает как обычно
+    if (e.code === 'Escape') { $('#trashp').hidden = $('#rootp').hidden = $('#menup').hidden = true; e.preventDefault(); return; }
+    if (e.target.closest('#trashp,#rootp,#menup')) return;
+    $('#trashp').hidden = $('#rootp').hidden = $('#menup').hidden = true;
   }
   if (viewer) { if (viewerKey(e)) e.preventDefault(); return; }
   if (zone === 'tree' && treeKey(e)) { e.preventDefault(); return; }
@@ -5562,9 +6080,10 @@ function viewerKey(e) {
   if (k === 'KeyZ' && (e.ctrlKey || e.metaKey) && !e.altKey) { if (!e.repeat) undoLast(); return true; }
   if (e.altKey || e.metaKey) return false;
   if (k === 'ArrowLeft' || k === 'ArrowRight') {
-    const dir = k === 'ArrowLeft' ? -1 : 1;
-    if (!e.ctrlKey && !e.shiftKey) { vGo(cur + dir); return true; }
-    if (pLoaded()) { pSeekBy(dir * (e.ctrlKey ? (e.shiftKey ? 120 : 30) : 5)); return true; }
+    // видео играет: голая стрелка — 5 с, Shift — 30 с, Ctrl — 2 мин; на паузе и на листе голая стрелка — соседнее видео
+    const dir = k === 'ArrowLeft' ? -1 : 1, playing = pLoaded() && P.vid && !vv.paused;
+    if (!e.ctrlKey && !e.shiftKey && !playing) { vGo(cur + dir); return true; }
+    if (pLoaded()) { pSeekBy(dir * (e.ctrlKey ? 120 : e.shiftKey ? 30 : 5)); return true; }
     return false;
   }
   if (e.ctrlKey) return false;
@@ -5698,8 +6217,8 @@ function vstat() {
     $('#cnt').textContent = list.length + ' ' + plural(list.length, ['video', 'videos']) + ' without previews' + (list.length !== videos.length ? ' of ' + videos.length : '');
   }
   const b = $('#vmake');
-  b.disabled = !picked.length || job.running || !ff.ok;
-  b.textContent = job.running ? 'Creating…' : 'Create previews' + (picked.length ? ' (' + picked.length + ')' : '');
+  b.disabled = !picked.length || !ff.ok;  // пока очередь идёт, выбранные дописываются в неё
+  b.textContent = (job.running ? 'Add to queue' : 'Create previews') + (picked.length ? ' (' + picked.length + ')' : '');
   const note = $('#vnote');
   if (!ff.ok) {
     note.hidden = false;
@@ -5726,7 +6245,6 @@ function vstat() {
 function redoStat() {
   const n = items.filter(i => i.nv).length, b = $('#redo');
   b.hidden = !n || mode !== 'previews' || !ff.ok;
-  b.disabled = job.running;
   b.textContent = 'Recreate previews (' + n + ')';
   const k = items.filter(i => !i.nv).length, o = $('#orph');
   o.hidden = !k || mode !== 'previews';
@@ -5752,9 +6270,11 @@ async function startMake(ids, redo) {
   if (!ids) ids = videos.filter(inView).filter(isSel).map(v => v.id);
   if (!ids.length) return;
   try {
+    const was = job.running;
     job = await api('/api/make', true, {ids, redo: !!redo});
+    if (was) toast('Added to the preview queue: ' + ids.length + ' ' + plural(ids.length, ['video', 'videos']));
     wasRunning = true;
-    lastFail = 0;
+    if (!was) lastFail = 0;
     renderVideos();
     renderJob();
     watchJob();
@@ -5766,25 +6286,35 @@ async function stopMake() {
   try { job = await api('/api/make/stop', true); renderJob(); } catch (e) { toast('Not stopped: ' + e.message, true); }
 }
 function watchJob() { if (!jobTimer) jobTimer = setTimeout(tickJob, 1000); }
+// ход создания превью: опрос раз в секунду. Любой сбой (сеть, ошибка отрисовки) не должен его обрывать — раньше обрывал,
+// и страница навсегда оставалась с прошлым статусом
 async function tickJob() {
   jobTimer = 0;
+  let j;
   try {
-    const prevOk = job.ok;
-    job = await api('/api/make');
-    renderJob();
-    if (job.ok !== prevOk || !job.running) await load();   // появились новые превью — обновить списки
-    const fails = Object.keys(job.failed).length;
-    if (fails !== lastFail) { lastFail = fails; if (mode === 'videos') renderVideos(); }
-    if (job.running) {
-      watchJob();
-    } else if (wasRunning) {
-      wasRunning = false;
-      renderJob();
-      toast((job.stopped ? 'Stopped. ' : 'Done. ') + (job.redo ? 'Previews recreated: ' : 'Previews created: ') + job.ok +
-        (fails ? ', errors: ' + fails + ' (marked red in the list)' : ''), fails > 0);
-    }
+    j = await api('/api/make');
   } catch (e) {
     toast('No connection to the server: ' + e.message, true);
+    jobTimer = setTimeout(tickJob, 3000);
+    return;
+  }
+  const prevOk = job.ok, prevDone = job.done;
+  job = j;
+  const fails = Object.keys(job.failed).length;
+  try {
+    renderJob();
+    if (job.ok !== prevOk || job.done !== prevDone || !job.running) await load();   // появились новые превью — обновить списки
+    if (fails !== lastFail) { lastFail = fails; if (mode === 'videos') renderVideos(); }
+  } catch (e) {
+    console.error('Preview progress:', e);
+  }
+  if (job.running) {
+    watchJob();
+  } else if (wasRunning) {
+    wasRunning = false;
+    renderJob();
+    toast((job.stopped ? 'Stopped. ' : 'Done. ') + (job.redo ? 'Previews recreated: ' : 'Previews created: ') + job.ok +
+      (fails ? ', errors: ' + fails + ' (marked red in the list)' : ''), fails > 0);
   }
 }
 
@@ -5823,7 +6353,7 @@ $('#vnone').onclick = () => {
 $('#vmake').onclick = () => startMake();
 $('#redo').onclick = async () => {
   const ids = items.filter(i => i.nv).map(i => i.id);
-  if (!ids.length || job.running) return;
+  if (!ids.length) return;
   const where = folder ? 'in "' + folder + '"' + (deep ? ' and its subfolders' : '') : 'in all folders';
   const yes = await ask('Recreate ' + ids.length + ' ' + plural(ids.length, ['preview', 'previews']) + ' ' + where + '?\n\nFormat: ' + opts.cols + '×' + opts.rows + ' grid, ' +
     opts.width + ' px, ' + (opts.header ? 'with header' : 'timestamps only') + '.\nOld previews will be moved to _to_delete, videos are not touched.', 'Recreate');
@@ -5838,6 +6368,7 @@ function trashStat() {
   if (purgeSt.running) { purgeUi(); return; }  // идёт очистка: кнопка показывает её ход
   const n = trashInfo.files, b = $('#trash');
   b.hidden = !n;
+  b.title = 'Files you deleted in the gallery that are still in the _to_delete folder';
   b.textContent = 'To delete: ' + n + ' ' + plural(n, ['file', 'files']) + ', ' + fmtSize(trashInfo.bytes) +
     (trashInfo.pending ? ' (counting…)' : '');
   if (!n) $('#trashp').hidden = true;
@@ -5914,9 +6445,10 @@ function purgeUi() {
   if (!s.running) return;
   const t = 'Deleting permanently: ' + s.removed + (s.total ? ' of ' + s.total : '') + ' ' + plural(s.total || s.removed, ['file', 'files']) +
     ', freed ' + fmtSize(s.bytes) + '…';
-  $('#trashi').textContent = t + ' You can keep working; the result will be shown here.';
+  $('#trashi').textContent = t + ' You can keep working.';
   $('#trash').hidden = false;
-  $('#trash').textContent = 'Deleting: ' + s.removed + (s.total ? ' / ' + s.total : '') + '…';
+  $('#trash').textContent = 'Deleting permanently: ' + s.removed + (s.total ? ' / ' + s.total : '') + ' · ' + fmtSize(s.bytes);
+  $('#trash').title = t;
 }
 function purgeShow(s) {
   purgeSt = s;
@@ -5940,6 +6472,7 @@ async function purgeTick() {
 }
 $('#tpurge').onclick = async () => {
   $('#tpurge').disabled = true;
+  $('#trashp').hidden = true;  // ход — короткой строкой на кнопке в шапке, окно не мешает работать
   try {
     if (purgeSeen < 0) purgeSeen = purgeSt.seq || 0;
     purgeShow(await api('/api/purge', true));
@@ -6093,7 +6626,7 @@ addEventListener('contextmenu', e => {
         player.add && {t: addTo, off: !wv.length, f: () => mpcSend({ids: wv}, true)},
         {t: 'Copy paths', f: () => copyPaths({ids})},
         win && {t: 'Copy files', f: () => copyPaths({ids}, true)},
-        {t: 'Recreate previews (' + wv.length + ')', off: !wv.length || job.running || !ff.ok, f: () => $('#sredo').click()},
+        {t: 'Recreate previews (' + wv.length + ')', off: !wv.length || !ff.ok, f: () => $('#sredo').click()},
         '-',
         {t: 'Delete (' + sel.length + ')', del: true, f: deleteSelected},
       ]);
@@ -6107,7 +6640,7 @@ addEventListener('contextmenu', e => {
       {t: show, f: showCur},
       {t: 'Copy path', f: () => copyPaths({ids: [it.id]})},
       win && {t: 'Copy file', f: () => copyPaths({ids: [it.id]}, true)},
-      {t: 'Recreate preview', off: !it.nv || job.running || !ff.ok, f: () => startMake([it.id], true)},
+      {t: 'Recreate preview', off: !it.nv || !ff.ok, f: () => startMake([it.id], true)},
       '-',
       {t: it.nv ? 'Delete video' : 'Delete preview', del: true, f: removeCur},
     ]);
@@ -6123,7 +6656,7 @@ addEventListener('contextmenu', e => {
       {t: show, f: () => api('/api/explorer', true, {id: v.id}).catch(err => toast('Not opened: ' + err.message, true))},
       {t: 'Copy path', f: () => copyPaths({ids: [v.id]})},
       win && {t: 'Copy file', f: () => copyPaths({ids: [v.id]}, true)},
-      {t: 'Make preview', off: job.running || !ff.ok, f: () => startMake([v.id])},
+      {t: 'Make preview', off: !ff.ok, f: () => startMake([v.id])},
     ]);
     return;
   }
@@ -6156,10 +6689,13 @@ function pickStat() {
   $('#selcnt').textContent = 'Selected: ' + n;
   $('#sdel').textContent = 'Delete (' + n + ')';
   $('#sredo').textContent = 'Recreate previews (' + withVideo + ')';
-  $('#sredo').disabled = !withVideo || job.running || !ff.ok;
+  $('#sredo').disabled = !withVideo || !ff.ok;
   $('#splay').textContent = 'Play in ' + player.name + ' (' + withVideo + ')';
   $('#splay').title = 'Play the selected videos in ' + player.name;
   $('#splay').disabled = !withVideo;
+  const mergeable = sel.filter(i => i.nv === 1).length;
+  $('#smerge').textContent = 'Merge (' + mergeable + ')…';
+  $('#smerge').hidden = mergeable < 2 || !ff.ok;
   if (viewer && items[cur]) $('#vpk').textContent = picked.has(items[cur].id) ? '✓ Selected' : 'Select';
 }
 
@@ -6202,12 +6738,13 @@ $('#sall').onclick = () => { items.forEach(i => picked.add(i.id)); pickStat(); }
 $('#snone').onclick = () => { picked.clear(); pickStat(); };
 $('#sredo').onclick = async () => {
   const ids = items.filter(i => picked.has(i.id) && i.nv).map(i => i.id);
-  if (!ids.length || job.running) return;
+  if (!ids.length) return;
   const yes = await ask('Recreate the previews of ' + ids.length + ' selected ' + plural(ids.length, ['video', 'videos']) + '?\n\nFormat: ' + opts.cols + '×' + opts.rows + ' grid, ' +
     opts.width + ' px, ' + (opts.header ? 'with header' : 'timestamps only') +
     '.\nOld previews will be moved to _to_delete, videos are not touched.', 'Recreate');
   if (yes) { picked.clear(); pickStat(); startMake(ids, true); }
 };
+$('#smerge').onclick = openMerge;
 $('#splay').onclick = () => {
   const ids = items.filter(i => picked.has(i.id) && i.nv).map(i => i.id);
   if (ids.length) mpcSend({ids}, false);
