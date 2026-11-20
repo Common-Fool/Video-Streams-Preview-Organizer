@@ -4787,7 +4787,7 @@ function showViewer() {
   } else if (!pLoaded()) pView(false);  // видео отпустили (например, удаление не удалось) — лист
   else if (P.vid && vv.paused) { pView(true); pPauseLater(); }  // кадр паузы: таймер возврата к листу заново
   else pView(P.vid);
-  for (const d of [1, 2, -1]) if (items[cur + d]) new Image().src = purl(items[cur + d]);
+  for (const d of [1, 2, -1]) if (items[vAt(d)]) new Image().src = purl(items[vAt(d)]);
   barShow();
 }
 function openViewer(play = false) {
@@ -4818,10 +4818,16 @@ function vCross(dir, last = false) {
   hud(ok ? 'Folder: ' + (folder || ROOT) : dir > 0 ? 'Last folder' : 'First folder');
   return ok;
 }
-function vGo(n) {
+// Листание в просмотре идёт по порядку галереи, кроме сортировки по дате: там «вперёд» — всегда к более новому,
+// даже если галерея (sdesc) и дерево (tdesc) развёрнуты — свежие сверху (решение владельца).
+// dir: +1 — дальше, -1 — назад; vRev() — просмотр идёт против галереи; vAt(dir) — номер соседней плитки в галерее
+const vRev = () => sort === 'date' && sdesc;
+const vAt = dir => cur + (vRev() ? -dir : dir);
+function vStep(dir) {
   if (C) return;
-  if (n < 0 || n >= items.length) { vCross(n < 0 ? -1 : 1, n < 0); return; }
-  go(n);
+  const n = vAt(dir);
+  if (n >= 0 && n < items.length) { go(n); return; }
+  vCross(sort === 'date' && tdesc ? -dir : dir, n < 0);  // за краем — соседняя папка; встать на её «начало» по тому же порядку
 }
 
 /* ───── встроенный плеер (как в VO Media): видео прямо в просмотре вместо листа ───── */
@@ -4937,7 +4943,7 @@ function pRelease() {
   vv.hidden = true;
 }
 function pPrefetch() {
-  const it = items.slice(cur + 1).find(it => it.nv && !trimBusy(it.id));
+  const it = (vRev() ? items.slice(0, cur).reverse() : items.slice(cur + 1)).find(it => it.nv && !trimBusy(it.id));
   if (!it || P.prefetched.has(it.id)) return;
   P.prefetched.add(it.id);
   api('/api/prefetch', true, {id: it.id}).catch(() => {});
@@ -5072,7 +5078,8 @@ function pEnded() {
   pUi();
   if (pNext && !pLoop) {
     const it = P.file;
-    for (let i = cur + 1; i < items.length; i++) {
+    const s = vRev() ? -1 : 1;  // следующее — по порядку просмотра (vStep)
+    for (let i = cur + s; i >= 0 && i < items.length; i += s) {
       if (it && items[i].dir === it.dir && items[i].nv) { P.start = true; go(i); return; }
     }
   }
@@ -5232,7 +5239,7 @@ $('#vstage').addEventListener('wheel', e => {
   const now = performance.now();
   if (!e.deltaY || now - P.wheelAt < 120) return;
   P.wheelAt = now;
-  vGo(cur + (e.deltaY > 0 ? 1 : -1));
+  vStep(e.deltaY > 0 ? 1 : -1);
 }, {passive: false});
 function vClick(e) {
   if (C || e.button !== 0) return;
@@ -5999,8 +6006,8 @@ $('#tsdir').onclick = () => {
 };
 document.addEventListener('click', e => { const b = e.target.closest('button'); if (b) b.blur(); });
 
-$('#vprev').onclick = () => vGo(cur - 1);
-$('#vnext').onclick = () => vGo(cur + 1);
+$('#vprev').onclick = () => vStep(-1);
+$('#vnext').onclick = () => vStep(1);
 $('#vopen').onclick = openCur;
 $('#vdel').onclick = removeCur;
 $('#vclose').onclick = () => closeViewer();
@@ -6080,9 +6087,11 @@ function viewerKey(e) {
   if (k === 'KeyZ' && (e.ctrlKey || e.metaKey) && !e.altKey) { if (!e.repeat) undoLast(); return true; }
   if (e.altKey || e.metaKey) return false;
   if (k === 'ArrowLeft' || k === 'ArrowRight') {
-    // видео играет: голая стрелка — 5 с, Shift — 30 с, Ctrl — 2 мин; на паузе и на листе голая стрелка — соседнее видео
+    // видео играет: голая стрелка — 5 с, Shift — 30 с, Ctrl — 2 мин; на паузе и на листе голая стрелка — соседнее видео,
+    // по одному на нажатие: автоповтор зажатой клавиши не листает (иначе после конца видео перемотка зажатой
+    // стрелкой проскакивала десятки превью)
     const dir = k === 'ArrowLeft' ? -1 : 1, playing = pLoaded() && P.vid && !vv.paused;
-    if (!e.ctrlKey && !e.shiftKey && !playing) { vGo(cur + dir); return true; }
+    if (!e.ctrlKey && !e.shiftKey && !playing) { if (!e.repeat) vStep(dir); return true; }
     if (pLoaded()) { pSeekBy(dir * (e.ctrlKey ? 120 : e.shiftKey ? 30 : 5)); return true; }
     return false;
   }
